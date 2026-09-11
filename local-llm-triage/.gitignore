@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+parsed/
+stacked/
+triaged/
+triage_run/
+selftest_out/
+reviewed.xlsx
+*.tar.gz
