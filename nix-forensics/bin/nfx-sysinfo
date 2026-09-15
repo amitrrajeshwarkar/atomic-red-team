@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# nfx-sysinfo - host identification and environment snapshot (start every case here).
+set -u
+NFX_TOOL="nfx-sysinfo"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-sysinfo - host identity, OS, kernel, uptime, timezone, hardware, virtualization, IPs.
+
+Usage: nfx-sysinfo [-o FILE] [--no-color]
+
+Captures the baseline facts every report needs: who the host is, when it booted,
+what clock it thinks it is, and whether it is physical, virtual or a container.
+ATT&CK context: T1082 (System Information Discovery) - the same data an adversary
+gathers first is the data an analyst needs first.
+USAGE
+}
+nfx_std_args "$@"
+nfx_banner
+
+nfx_header "Identity"
+printf 'hostname   : %s\n' "$(hostname 2>/dev/null)"
+printf 'fqdn       : %s\n' "$(hostname -f 2>/dev/null || echo n/a)"
+printf 'kernel     : %s\n' "$(uname -srm 2>/dev/null)"
+printf 'uname -a   : %s\n' "$(uname -a 2>/dev/null)"
+if nfx_is_macos; then
+  printf 'os         : %s %s (build %s)\n' "$(sw_vers -productName 2>/dev/null)" "$(sw_vers -productVersion 2>/dev/null)" "$(sw_vers -buildVersion 2>/dev/null)"
+  printf 'model      : %s\n' "$(sysctl -n hw.model 2>/dev/null)"
+  printf 'serial     : %s\n' "$(ioreg -l 2>/dev/null | awk -F'"' '/IOPlatformSerialNumber/{print $4; exit}')"
+  printf 'hw uuid    : %s\n' "$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/{print $4}')"
+  printf 'cpu        : %s\n' "$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+  printf 'memory     : %s MB\n' "$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576 ))"
+else
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    printf 'os         : %s\n' "$(. /etc/os-release; echo "${PRETTY_NAME:-$NAME $VERSION}")"
+  fi
+  [ -r /etc/machine-id ] && printf 'machine-id : %s\n' "$(cat /etc/machine-id)"
+  printf 'cpu        : %s\n' "$(awk -F: '/model name/{gsub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)"
+  printf 'cpus       : %s\n' "$(grep -c ^processor /proc/cpuinfo 2>/dev/null)"
+  printf 'memory     : %s MB\n' "$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)"
+  if nfx_have dmidecode && nfx_is_root; then
+    printf 'vendor     : %s / %s\n' "$(dmidecode -s system-manufacturer 2>/dev/null)" "$(dmidecode -s system-product-name 2>/dev/null)"
+    printf 'serial     : %s\n' "$(dmidecode -s system-serial-number 2>/dev/null)"
+  elif [ -r /sys/class/dmi/id/product_name ]; then
+    printf 'vendor     : %s / %s\n' "$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)" "$(cat /sys/class/dmi/id/product_name 2>/dev/null)"
+  fi
+fi
+
+nfx_header "Time"
+printf 'now (local): %s\n' "$(date)"
+printf 'now (utc)  : %s\n' "$(nfx_now_iso)"
+if nfx_is_macos; then
+  bt=$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/.*sec = ([0-9]+).*/\1/')
+  printf 'boot (utc) : %s\n' "$(nfx_epoch_to_iso "$bt")"
+  printf 'timezone   : %s\n' "$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')"
+  nfx_have systemsetup && nfx_is_root && printf 'ntp        : %s\n' "$(systemsetup -getnetworktimeserver 2>/dev/null)"
+else
+  bt=$(awk '/btime/{print $2}' /proc/stat 2>/dev/null)
+  printf 'boot (utc) : %s\n' "$(nfx_epoch_to_iso "$bt")"
+  printf 'timezone   : %s\n' "$( (cat /etc/timezone 2>/dev/null) || (readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##') )"
+  nfx_have timedatectl && timedatectl 2>/dev/null | sed 's/^/             /'
+fi
+printf 'uptime     : %s\n' "$(uptime 2>/dev/null)"
+
+nfx_header "Virtualization / Container"
+if nfx_is_linux; then
+  if nfx_have systemd-detect-virt; then printf 'detect-virt: %s\n' "$(systemd-detect-virt 2>/dev/null || echo none)"; fi
+  [ -f /.dockerenv ] && nfx_info "/.dockerenv present - running inside a Docker container"
+  grep -qaE 'docker|lxc|kubepods|containerd' /proc/1/cgroup 2>/dev/null && nfx_info "cgroup of PID 1 indicates a container: $(head -1 /proc/1/cgroup)"
+  grep -qi hypervisor /proc/cpuinfo 2>/dev/null && nfx_info "CPU reports hypervisor flag (virtual machine)"
+  [ -r /sys/class/dmi/id/product_name ] && grep -qiE 'virtual|vmware|kvm|qemu|xen|hyper-v|bochs' /sys/class/dmi/id/product_name && nfx_info "DMI product name suggests VM: $(cat /sys/class/dmi/id/product_name)"
+else
+  sysctl -n machdep.cpu.features 2>/dev/null | grep -q VMM && nfx_info "CPU reports VMM feature (virtual machine)"
+  system_profiler SPHardwareDataType 2>/dev/null | grep -iE 'model|serial|uuid' | sed 's/^ */  /'
+fi
+
+nfx_header "Network identity"
+if nfx_is_macos; then
+  ifconfig 2>/dev/null | awk '/^[a-z]/{iface=$1} /inet /{print iface, $2} /ether /{print iface, "mac", $2}'
+  printf 'dns        : %s\n' "$(scutil --dns 2>/dev/null | awk '/nameserver\[/{print $3}' | sort -u | tr '\n' ' ')"
+else
+  if nfx_have ip; then ip -o addr show 2>/dev/null | awk '{print $2, $3, $4}'; ip -o link show 2>/dev/null | awk '{print $2, "mac", $(NF-2)}' | grep -v 'lo:'
+  else ifconfig -a 2>/dev/null | awk '/^[a-z]/{iface=$1} /inet /{print iface, $2}'; fi
+  printf 'gateway    : %s\n' "$( (ip route 2>/dev/null || route -n 2>/dev/null) | awk '/default/{print $3; exit}')"
+  printf 'dns        : %s\n' "$(awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ')"
+fi
+
+nfx_header "Logged-in users"
+w 2>/dev/null || who 2>/dev/null
+
+nfx_header "Storage"
+df -h 2>/dev/null | grep -vE '^(tmpfs|devtmpfs|udev|map |devfs)' | head -40
+
+nfx_header "Collector context"
+printf 'collector  : uid=%s (%s) pid=%s tty=%s\n' "$(id -u)" "$(id -un)" "$$" "$(tty 2>/dev/null || true)"
+printf 'shell      : %s (bash %s)\n' "${SHELL:-?}" "${BASH_VERSION:-?}"
+printf 'PATH       : %s\n' "$PATH"
+nfx_root_hint

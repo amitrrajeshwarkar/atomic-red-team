@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# nfx-packages - installed software, recent installs, package integrity and orphan binaries
+set -u
+NFX_TOOL="nfx-packages"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-packages - installed packages, recent install/remove history, package-manager integrity
+verification, binaries in system paths not owned by any package, language-level packages.
+
+Usage: nfx-packages [--since SPEC] [--verify] [--orphans] [-o FILE] [--no-color]
+  --since SPEC   window for "recent" install history (default 30d)
+  --verify       run dpkg -V / rpm -Va / pkgutil verification (slow, minutes on big hosts)
+  --orphans      list files in /bin /sbin /usr/bin /usr/sbin /usr/lib* not owned by any package
+
+Managers: dpkg/apt, rpm/yum/dnf, pacman, apk, zypper, snap, flatpak, brew, pkgutil (macOS receipts),
+macOS install history, pip/pip3, npm -g, gem.
+ATT&CK: T1072 (Software Deployment Tools), T1195 (Supply Chain Compromise), T1036.005 (Masquerading),
+T1554 (Compromise Host Software Binary), T1546.016 (Installer Packages).
+USAGE
+}
+SINCE="30d"; VERIFY=0; ORPH=0
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do case "$1" in --since) SINCE="$2"; shift ;; --verify) VERIFY=1 ;; --orphans) ORPH=1 ;; *) nfx_die "unknown option: $1";; esac; shift; done
+mins=$(nfx_since_to_minutes "$SINCE"); cut=$(( $(nfx_now_epoch) - mins*60 ))
+nfx_banner; nfx_root_hint
+cutdate=$(nfx_epoch_to_iso "$cut" | cut -c1-10)
+nfx_info "recent window: since $cutdate"
+
+if nfx_is_linux; then
+  if nfx_have dpkg; then
+    nfx_header "dpkg / apt"
+    printf 'installed packages: %s\n' "$(dpkg-query -W 2>/dev/null | wc -l | tr -d ' ')"
+    nfx_section "installs/removes since $cutdate (dpkg.log)"
+    nfx_read_logs /var/log/dpkg.log 2>/dev/null | awk -v c="$cutdate" '$1 >= c && ($3=="install" || $3=="remove" || $3=="purge" || $3=="upgrade") {print}' | tail -80
+    nfx_section "apt history since $cutdate (Commandline / Start-Date)"
+    nfx_read_logs /var/log/apt/history.log 2>/dev/null | awk -v c="$cutdate" '/^Start-Date:/{d=$2; keep=(d>=c)} keep && /^(Start-Date|Commandline|Requested-By|Install|Remove|Purge):/{print}' | tail -80
+    nfx_read_logs /var/log/apt/history.log 2>/dev/null | awk -v c="$cutdate" '/^Start-Date:/{d=$2; keep=(d>=c)} keep && /^Commandline:/{print}' | grep -E 'install' | grep -iE 'nmap|netcat|socat|hydra|john|hashcat|sqlmap|metasploit|tcpdump|wireshark|masscan|mimikatz|proxychains|tor\b|ngrok|xmrig|minerd|gcc|build-essential|python3-pip' |
+      while read -r l; do nfx_flag "TOOL-INSTALL" "$l"; done
+    nfx_section "packages not from a configured repository (apt-cache policy: /var/lib/dpkg/status only)"
+    nfx_have apt-cache && dpkg-query -W -f='${Package}\n' 2>/dev/null | head -3000 | xargs apt-cache policy 2>/dev/null | awk '/^[^ ]/{p=$1} /\*\*\*/{getline; if ($0 ~ /status/) print p}' | head -30 | while read -r p; do nfx_info "locally-installed (no repo origin): $p"; done
+    nfx_section "sources"
+    grep -rhE '^deb ' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | sort -u; grep -rhE '^URIs:' /etc/apt/sources.list.d/*.sources 2>/dev/null
+    grep -rhE '^(deb |URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -vE 'ubuntu\.com|debian\.org|launchpad|docker\.com|microsoft\.com|google\.com|nodesource|postgresql\.org|kali\.org|raspbian|raspberrypi|githubusercontent|hashicorp|grafana|elastic\.co|jenkins|kubernetes|nvidia|mozilla|brave|signal|spotify|virtualbox|vscode|packages\.cloud|deb\.sury|nginx\.org|mariadb|mongodb|yarnpkg|proxmox|opensuse|linuxmint|pop-os|zorin|deepin|neon|tailscale|1password|wine|lutris|obsproject|syncthing|insync|dropbox|slack|discord|zoom' |
+      while read -r l; do nfx_info "third-party apt source: $l"; done
+    if [ "$VERIFY" = 1 ]; then
+      nfx_section "dpkg -V (modified package files: 5=md5 mismatch)"
+      if nfx_have debsums; then debsums -c 2>/dev/null | head -100 | while read -r l; do nfx_flag "PKG-MODIFIED" "$l"; done
+      else dpkg -V 2>/dev/null | grep -vE '^\?\?5\?\?\?\?\?\?   ?c /etc/' | head -100 | while read -r l; do nfx_flag "PKG-MODIFIED" "$l"; done; fi
+    fi
+  fi
+  if nfx_have rpm; then
+    nfx_header "rpm / yum / dnf"
+    printf 'installed packages: %s\n' "$(rpm -qa 2>/dev/null | wc -l | tr -d ' ')"
+    nfx_section "most recently installed (rpm -qa --last)"
+    rpm -qa --last 2>/dev/null | head -60
+    nfx_section "transaction history"
+    (dnf history list 2>/dev/null || yum history list 2>/dev/null) | head -40
+    nfx_section "unsigned / unknown-key packages"
+    rpm -qa --qf '%{NAME}-%{VERSION} %{SIGPGP:pgpsig} %{VENDOR}\n' 2>/dev/null | grep -E '\(none\)' | head -40 | while read -r l; do nfx_info "unsigned rpm: $l"; done
+    if [ "$VERIFY" = 1 ]; then
+      nfx_section "rpm -Va (S=size M=mode 5=md5 U=user G=group T=mtime; config files excluded)"
+      rpm -Va 2>/dev/null | grep -vE '^[^ ]+ +c ' | grep -E '^..5|^S|^.M' | head -100 | while read -r l; do nfx_flag "PKG-MODIFIED" "$l"; done
+    fi
+    for b in /usr/bin/ssh /usr/sbin/sshd /usr/bin/sudo /usr/bin/passwd /usr/bin/ls /usr/bin/ps /usr/bin/netstat /usr/bin/ss /usr/bin/find /usr/bin/lsof /usr/sbin/lsof /usr/bin/top /usr/bin/login /usr/bin/su /usr/bin/curl /usr/bin/wget /usr/lib64/libc.so.6 /usr/lib64/libpam.so.0 /usr/bin/crontab /usr/sbin/crond; do
+      [ -e "$b" ] && rpm -Vf "$b" 2>/dev/null | grep -E '^..5' | while read -r l; do nfx_flag "CRITICAL-BIN-MODIFIED" "$l"; done
+    done
+  fi
+  if nfx_have pacman; then
+    nfx_header "pacman"
+    printf 'installed packages: %s\n' "$(pacman -Q 2>/dev/null | wc -l | tr -d ' ')"
+    nfx_section "installs since $cutdate"
+    grep -E '\[ALPM\] (installed|removed|upgraded)' /var/log/pacman.log 2>/dev/null | awk -v c="$cutdate" '{d=substr($1,2,10); if (d>=c) print}' | tail -60
+    [ "$VERIFY" = 1 ] && { nfx_section "pacman -Qkk"; pacman -Qkk 2>/dev/null | grep -vE '0 altered files' | head -60 | while read -r l; do nfx_flag "PKG-MODIFIED" "$l"; done; }
+  fi
+  if nfx_have apk; then
+    nfx_header "apk"; apk info 2>/dev/null | wc -l; [ "$VERIFY" = 1 ] && apk audit --system 2>/dev/null | head -60
+  fi
+  nfx_have snap && { nfx_header "snap"; snap list --all 2>/dev/null; }
+  nfx_have flatpak && { nfx_header "flatpak"; flatpak list 2>/dev/null; }
+  if nfx_have dpkg; then
+    nfx_header "Critical binaries vs dpkg md5sums"
+    for b in /usr/bin/ssh /usr/sbin/sshd /usr/bin/sudo /usr/bin/passwd /usr/bin/ls /usr/bin/ps /usr/bin/netstat /usr/bin/ss /usr/bin/find /usr/bin/lsof /usr/bin/top /usr/bin/login /usr/bin/su /usr/bin/curl /usr/bin/wget /usr/bin/crontab /usr/sbin/cron /usr/bin/dpkg /usr/bin/apt /usr/bin/systemctl /usr/bin/journalctl /usr/bin/lsmod /usr/bin/id /usr/bin/who /usr/bin/last /usr/bin/w /bin/bash /bin/sh; do
+      [ -e "$b" ] || continue
+      rel=${b#/}; [ -e "/$rel" ] || continue
+      real=$(readlink -f "$b" 2>/dev/null || echo "$b"); rel=${real#/}
+      expected=$(grep -h " $rel\$" /var/lib/dpkg/info/*.md5sums 2>/dev/null | head -1 | awk '{print $1}')
+      [ -z "$expected" ] && { case "$rel" in usr/*) expected=$(grep -h " ${rel#usr/}\$" /var/lib/dpkg/info/*.md5sums 2>/dev/null | head -1 | awk '{print $1}');; esac; }
+      [ -z "$expected" ] && { printf '%-24s no package md5 recorded\n' "$b"; continue; }
+      actual=$(nfx_md5 "$real")
+      if [ "$expected" = "$actual" ]; then printf '%-24s OK\n' "$b"; else printf '%-24s MISMATCH (pkg=%s disk=%s)\n' "$b" "$expected" "$actual"; nfx_flag "CRITICAL-BIN-MODIFIED" "$b md5 differs from package manifest (trojaned or locally rebuilt?)"; fi
+    done
+  fi
+  if [ "$ORPH" = 1 ]; then
+    nfx_header "Binaries in system paths not owned by any package"
+    owned=$(nfx_mktemp); onDisk=$(nfx_mktemp)
+    if nfx_have dpkg; then cat /var/lib/dpkg/info/*.list 2>/dev/null | sed -E 's#^/usr/(bin|sbin|lib|lib64)#/\1#' | sort -u > "$owned"
+    elif nfx_have rpm; then rpm -qal 2>/dev/null | sed -E 's#^/usr/(bin|sbin|lib|lib64)#/\1#' | sort -u > "$owned"
+    elif nfx_have pacman; then pacman -Ql 2>/dev/null | awk '{print $2}' | sed -E 's#/$##; s#^/usr/(bin|sbin|lib|lib64)#/\1#' | sort -u > "$owned"
+    elif nfx_have apk; then apk info -L 2>/dev/null | grep -v ':' | sed -E 's#^#/#; s#^/usr/(bin|sbin|lib|lib64)#/\1#' | sort -u > "$owned"; fi
+    if [ -s "$owned" ]; then
+      find /bin /sbin /usr/bin /usr/sbin /usr/lib /usr/lib64 /lib /lib64 -xdev -type f 2>/dev/null | sed -E 's#^/usr/(bin|sbin|lib|lib64)#/\1#' | sort -u > "$onDisk"
+      comm -23 "$onDisk" "$owned" | grep -vE '\.pyc$|__pycache__|/python3?\.[0-9]+/|/site-packages/|/dist-packages/|/node_modules/|/locale/|/firmware/|/modules/|\.cache|/gconv/|/systemd/(system|user)/|/udev/hwdb|/dpkg/|/apt/|/snap/' | head -200 | while read -r f; do
+        real="$f"; [ -e "$real" ] || real="/usr$f"
+        printf '%s\n' "$real"
+        case "$real" in /usr/local/*) ;; /bin/*|/sbin/*|/usr/bin/*|/usr/sbin/*) nfx_flag "ORPHAN-BIN" "binary not owned by any package: $real";; esac
+      done
+    else nfx_info "no package file list available"; fi
+  fi
+else # macOS
+  nfx_header "Install history (system_profiler)"
+  system_profiler SPInstallHistoryDataType 2>/dev/null | awk -v c="$cutdate" '/^    [^ ]/{name=$0} /Install Date:/{d=$3; if (d>=c) {print name; print "   " $0; keep=1} else keep=0} keep && /(Version|Source|Process Name):/{print "   " $0}' | head -150
+  nfx_header "Package receipts (pkgutil)"
+  pkgutil --pkgs 2>/dev/null | grep -vE '^com\.apple\.' | while read -r p; do
+    it=$(pkgutil --pkg-info "$p" 2>/dev/null | awk '/install-time/{print $2}')
+    printf '%-60s installed=%s\n' "$p" "$(nfx_epoch_to_iso "$it")"
+    [ -n "$it" ] && [ "$it" -ge "$cut" ] && nfx_info "recent non-Apple package receipt: $p"
+  done
+  nfx_header "Applications"
+  for d in /Applications /Applications/Utilities; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 1 -name '*.app' 2>/dev/null | while read -r app; do
+      s=$(nfx_stat "$app"); m=${s%%|*}
+      auth=$(codesign -dv --verbose=2 "$app" 2>&1 | awk -F= '/^Authority=/{print $2; exit}')
+      printf '%-20s %-55s %s\n' "$(nfx_epoch_to_iso "$m")" "${app##*/}" "${auth:-UNSIGNED}"
+      [ -z "$auth" ] && nfx_flag "UNSIGNED-APP" "unsigned application bundle: $app"
+      [ "$m" -ge "$cut" ] && nfx_info "app installed/modified since $cutdate: $app"
+    done
+  done
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    [ -d "$h/Applications" ] && find "$h/Applications" -maxdepth 1 -name '*.app' 2>/dev/null | while read -r app; do printf '[user %s] %s\n' "$u" "$app"; done
+  done
+  if nfx_have brew || [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; then
+    nfx_header "Homebrew"
+    BREW=$(command -v brew || ls /opt/homebrew/bin/brew /usr/local/bin/brew 2>/dev/null | head -1)
+    owner=$(nfx_stat "$BREW" | cut -d'|' -f6)
+    if nfx_is_root && [ "$owner" != "0" ]; then ou=$(id -un "$owner" 2>/dev/null); sudo -u "$ou" "$BREW" list --versions 2>/dev/null | head -100; else "$BREW" list --versions 2>/dev/null | head -100; fi
+    for cellar in /opt/homebrew/Cellar /usr/local/Cellar; do [ -d "$cellar" ] && find "$cellar" -mindepth 2 -maxdepth 2 -mmin -"$mins" 2>/dev/null | while read -r p; do nfx_info "brew package installed since $cutdate: $p"; done; done
+  fi
+  [ -d /usr/local/bin ] && { nfx_header "/usr/local/bin (recent)"; find /usr/local/bin -maxdepth 1 -mmin -"$mins" 2>/dev/null | while read -r f; do nfx_info "recent: $f"; done; }
+fi
+
+nfx_header "Language package managers"
+for pip in pip3 pip; do nfx_have "$pip" && { nfx_section "$pip list (system)"; "$pip" list 2>/dev/null | head -80; break; }; done
+nfx_have npm && { nfx_section "npm -g"; npm ls -g --depth=0 2>/dev/null | head -60; }
+nfx_have gem && { nfx_section "gem list"; gem list 2>/dev/null | head -60; }
+nfx_section "per-user python/node packages installed since $cutdate"
+nfx_user_homes | while IFS=: read -r u uid h sh; do
+  for d in "$h/.local/lib" "$h/Library/Python" "$h/.npm-global" "$h/.cargo/bin" "$h/go/bin" "$h/.local/bin"; do
+    [ -d "$d" ] && find "$d" -mindepth 1 -maxdepth 3 -mmin -"$mins" 2>/dev/null | head -20 | while read -r f; do printf '[user %s] %s\n' "$u" "$f"; done
+  done
+done
+nfx_findings_summary

@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# nfx-persistence - enumerate every autostart/persistence location and flag suspicious entries
+set -u
+NFX_TOOL="nfx-persistence"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-persistence - enumerate autostart & persistence mechanisms and flag suspicious entries.
+
+Usage: nfx-persistence [--since SPEC] [--all] [-o FILE] [--no-color]
+  --since SPEC   highlight entries modified within window (default 30d)
+  --all          also dump full contents of every unit/plist/script (verbose)
+
+Linux: cron/anacron/at, systemd units+timers (system & user), generators, init.d/rc.local,
+shell profiles & rc files, /etc/ld.so.preload, /etc/environment, XDG autostart, udev rules,
+PAM, motd hooks, NetworkManager dispatcher, apt/yum hooks, python .pth/sitecustomize,
+modules-load, sshrc, gdm/Xsession hooks.
+macOS: LaunchDaemons/LaunchAgents (system+user), launchctl, login items (BTM/sfltool),
+LoginHook/LogoutHook, cron/at, periodic, emond, StartupItems, re-launch-at-login apps,
+configuration profiles, shell rc files, authorization plugins, folder actions.
+ATT&CK: T1053.003 (Cron), T1053.006 (Systemd Timers), T1543.002 (Systemd Service),
+T1543.001/T1543.004 (Launch Agent/Daemon), T1546.004 (Unix Shell Config Modification),
+T1546.016 (Installer Packages), T1547.006 (Kernel Modules), T1547.011 (Plist Modification),
+T1547.013 (XDG Autostart), T1547.015 (Login Items), T1574.006 (Dynamic Linker Hijacking),
+T1556.003 (PAM), T1037.002/T1037.004 (Login Hook / RC Scripts), T1546.014 (Emond).
+USAGE
+}
+SINCE="30d"; ALL=0
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) SINCE="$2"; shift ;;
+    --all) ALL=1 ;;
+    *) nfx_die "unknown option: $1 (see --help)" ;;
+  esac; shift
+done
+mins=$(nfx_since_to_minutes "$SINCE")
+now=$(nfx_now_epoch)
+nfx_banner
+nfx_root_hint
+nfx_info "entries modified in the last $SINCE are marked RECENT"
+
+# helpers ------------------------------------------------------------------
+recent_tag() { # recent_tag <file> -> " RECENT" if mtime within window
+  local s m; s=$(nfx_stat "$1") || return; m=${s%%|*}
+  [ $(( (now - m) / 60 )) -lt "$mins" ] && printf ' RECENT'
+}
+show_file() { # show_file <file> [label] : stat + content (or grep'd interesting lines)
+  local f="$1" lbl="${2:-$1}" r
+  [ -f "$f" ] || return
+  r=$(recent_tag "$f")
+  nfx_section "$lbl$r"
+  nfx_stat_line "$f"
+  if [ "$ALL" = 1 ]; then cat "$f" 2>/dev/null; else grep -vE '^[[:space:]]*(#|$)' "$f" 2>/dev/null | head -60; fi
+  [ -n "$r" ] && nfx_flag "RECENT" "$lbl modified within $SINCE"
+  nfx_grep_susp "$f" 10 | while read -r l; do nfx_flag "SUSPICIOUS" "$f:$l"; done
+}
+list_dir() { # list_dir <dir> : ls with times and recent flagging
+  local d="$1" f
+  [ -d "$d" ] || return
+  nfx_section "$d/"
+  nfx_ls_l "$d" | tail -n +2
+  for f in "$d"/* "$d"/.[!.]*; do
+    [ -e "$f" ] || continue
+    r=$(recent_tag "$f"); [ -n "$r" ] && nfx_flag "RECENT" "$f modified within $SINCE"
+    [ -f "$f" ] && nfx_grep_susp "$f" 5 | while read -r l; do nfx_flag "SUSPICIOUS" "$f:$l"; done
+  done
+}
+scan_dir_files() { # scan_dir_files <dir> [maxdepth]: show every regular file (skips huge ones)
+  local d="$1" depth="${2:-1}" f
+  [ -d "$d" ] || return
+  find "$d" -maxdepth "$depth" -type f 2>/dev/null | sort | while read -r f; do show_file "$f"; done
+}
+
+# =========================================================================
+if nfx_is_linux; then
+  nfx_header "Cron"
+  show_file /etc/crontab
+  show_file /etc/anacrontab
+  scan_dir_files /etc/cron.d
+  for d in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do list_dir "$d"; done
+  for d in /var/spool/cron/crontabs /var/spool/cron; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 1 -type f 2>/dev/null | while read -r f; do show_file "$f" "user crontab $f"; done
+  done
+  [ -d /var/spool/at ] && list_dir /var/spool/at
+  [ -d /var/spool/cron/atjobs ] && list_dir /var/spool/cron/atjobs
+  nfx_have atq && { nfx_section "atq"; atq 2>/dev/null; }
+
+  nfx_header "systemd"
+  if nfx_have systemctl; then
+    nfx_section "enabled services"
+    systemctl list-unit-files --type=service --state=enabled --no-legend --no-pager 2>/dev/null
+    nfx_section "timers"
+    systemctl list-timers --all --no-legend --no-pager 2>/dev/null
+    nfx_section "failed units"
+    systemctl --failed --no-legend --no-pager 2>/dev/null
+  fi
+  nfx_section "unit files outside the package tree (/etc/systemd, /run/systemd, ~/.config/systemd)"
+  for d in /etc/systemd/system /run/systemd/system /etc/systemd/user /usr/local/lib/systemd/system; do
+    [ -d "$d" ] || continue
+    find "$d" -type f \( -name '*.service' -o -name '*.timer' -o -name '*.socket' -o -name '*.path' -o -name '*.conf' \) 2>/dev/null | sort | while read -r f; do
+      r=$(recent_tag "$f")
+      exec_line=$(grep -E '^(ExecStart|ExecStartPre|ExecStartPost|ExecStop|ExecReload)=' "$f" 2>/dev/null | head -3 | tr '\n' ' ')
+      printf '%s%s\n    %s\n' "$f" "$r" "${exec_line:-(no Exec lines)}"
+      [ -n "$r" ] && nfx_flag "RECENT" "systemd unit modified within $SINCE: $f"
+      printf '%s\n' "$exec_line" | grep -qE "$NFX_SUSP_RE" && nfx_flag "SUSPICIOUS" "systemd unit $f: $exec_line"
+      printf '%s\n' "$exec_line" | grep -qE '=(/tmp|/dev/shm|/var/tmp|/home|/root)/' && nfx_flag "TEMP-EXEC" "systemd unit runs from temp/home dir: $f: $exec_line"
+      [ "$ALL" = 1 ] && sed 's/^/    | /' "$f"
+    done
+  done
+  nfx_section "per-user units"
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    [ -d "$h/.config/systemd/user" ] && find "$h/.config/systemd/user" -type f 2>/dev/null | while read -r f; do show_file "$f" "user=$u $f"; done
+  done
+  nfx_section "generators / drop-ins"
+  for d in /etc/systemd/system-generators /usr/local/lib/systemd/system-generators /run/systemd/generator; do list_dir "$d"; done
+  nfx_section "recently modified units in /lib|/usr/lib/systemd (package tree, should be rare)"
+  find /lib/systemd/system /usr/lib/systemd/system -maxdepth 1 -type f -mmin -"$mins" 2>/dev/null | head -20 |
+    while read -r f; do nfx_flag "RECENT" "package-tree unit modified within $SINCE: $f"; done
+
+  nfx_header "SysV init / rc"
+  show_file /etc/rc.local
+  show_file /etc/rc.d/rc.local
+  show_file /etc/inittab
+  [ -d /etc/init.d ] && { nfx_section "/etc/init.d (recent only)"; find /etc/init.d -type f -mmin -"$mins" 2>/dev/null | while read -r f; do nfx_flag "RECENT" "init script modified within $SINCE: $f"; done; }
+  [ -d /etc/init ] && scan_dir_files /etc/init
+
+  nfx_header "Dynamic linker hijacking"
+  if [ -s /etc/ld.so.preload ]; then
+    nfx_flag "LD_PRELOAD" "/etc/ld.so.preload is non-empty: $(tr '\n' ' ' < /etc/ld.so.preload)"
+    for lib in $(cat /etc/ld.so.preload); do [ -e "$lib" ] && nfx_stat_line "$lib" || nfx_flag "LD_PRELOAD" "preload library missing on disk: $lib"; done
+  elif [ -e /etc/ld.so.preload ]; then nfx_info "/etc/ld.so.preload exists but is empty"
+  else nfx_info "/etc/ld.so.preload not present (normal)"; fi
+  [ -d /etc/ld.so.conf.d ] && list_dir /etc/ld.so.conf.d
+  show_file /etc/environment
+  grep -rlE 'LD_PRELOAD|LD_LIBRARY_PATH' /etc/environment /etc/profile /etc/profile.d /etc/bash.bashrc /etc/bashrc /etc/zshenv /etc/zprofile /etc/zshrc 2>/dev/null |
+    while read -r f; do nfx_flag "LD-ENV" "LD_PRELOAD/LD_LIBRARY_PATH set in $f"; done
+
+  nfx_header "Shell startup files (system)"
+  for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/zshenv /etc/zprofile /etc/zshrc /etc/zlogin /etc/zlogout /etc/csh.cshrc /etc/csh.login /etc/fish/config.fish /etc/shells; do show_file "$f"; done
+  list_dir /etc/profile.d
+  [ -d /etc/fish/conf.d ] && list_dir /etc/fish/conf.d
+
+  nfx_header "XDG autostart / desktop"
+  for d in /etc/xdg/autostart /usr/share/gdm/autostart /etc/gdm3 /etc/gdm /etc/X11/Xsession.d /etc/X11/xinit/xinitrc.d; do list_dir "$d"; done
+  for f in /etc/gdm3/PostLogin/Default /etc/gdm3/PostSession/Default /etc/gdm3/Init/Default /etc/X11/Xsession; do show_file "$f"; done
+
+  nfx_header "udev rules"
+  [ -d /etc/udev/rules.d ] && { list_dir /etc/udev/rules.d; grep -rnE 'RUN\+?=' /etc/udev/rules.d 2>/dev/null | while read -r l; do nfx_flag "UDEV-RUN" "$l"; done; }
+
+  nfx_header "PAM"
+  [ -d /etc/pam.d ] && { nfx_section "/etc/pam.d recent changes"; find /etc/pam.d -type f -mmin -"$mins" 2>/dev/null | while read -r f; do nfx_flag "RECENT" "PAM config modified within $SINCE: $f"; done; }
+  grep -rnE 'pam_exec|pam_permit\.so|pam_succeed_if.*uid|auth[[:space:]]+sufficient[[:space:]]+pam_(permit|unix)' /etc/pam.d 2>/dev/null | grep -v 'pam_permit.so' | head -10 |
+    while read -r l; do nfx_flag "PAM-INTERESTING" "$l"; done
+  grep -rnE '^[^#]*auth[[:space:]]+sufficient[[:space:]]+pam_permit' /etc/pam.d 2>/dev/null | while read -r l; do nfx_flag "PAM-BACKDOOR" "auth sufficient pam_permit (allows any password): $l"; done
+  for d in /lib/security /lib64/security /usr/lib/security /usr/lib64/security /lib/x86_64-linux-gnu/security /usr/lib/x86_64-linux-gnu/security /usr/lib/aarch64-linux-gnu/security; do
+    [ -d "$d" ] || continue
+    find "$d" -name '*.so' -mmin -"$mins" 2>/dev/null | while read -r f; do nfx_flag "RECENT" "PAM module modified within $SINCE: $f"; done
+  done
+
+  nfx_header "Other hook directories"
+  for d in /etc/update-motd.d /etc/NetworkManager/dispatcher.d /etc/apt/apt.conf.d /etc/yum/pluginconf.d /etc/dnf/plugins /etc/modules-load.d /etc/sysctl.d /etc/security/limits.d /etc/dhcp/dhclient-exit-hooks.d /etc/ppp/ip-up.d /usr/local/sbin /usr/local/bin; do
+    [ -d "$d" ] || continue
+    nfx_section "$d/ (recent + suspicious only)"
+    find "$d" -maxdepth 1 -type f -mmin -"$mins" 2>/dev/null | while read -r f; do nfx_flag "RECENT" "$f modified within $SINCE"; done
+    find "$d" -maxdepth 1 -type f 2>/dev/null | while read -r f; do nfx_grep_susp "$f" 5 | while read -r l; do nfx_flag "SUSPICIOUS" "$f:$l"; done; done
+  done
+  nfx_section "apt/dpkg invoke hooks (review any that are not stock)"
+  grep -rnE 'Pre-Invoke|Post-Invoke|Pre-Install-Pkgs' /etc/apt/apt.conf.d 2>/dev/null
+  grep -rnE 'Pre-Invoke|Post-Invoke|Pre-Install-Pkgs' /etc/apt/apt.conf.d 2>/dev/null | grep -E "$NFX_SUSP_RE" | while read -r l; do nfx_flag "APT-HOOK" "$l"; done
+  show_file /etc/modules
+  show_file /etc/ssh/sshrc
+  nfx_section "python startup hooks (.pth / sitecustomize / usercustomize)"
+  find /usr/lib/python3* /usr/local/lib/python3* /usr/lib/python2* -maxdepth 3 \( -name '*.pth' -o -name 'sitecustomize.py' -o -name 'usercustomize.py' \) -type f 2>/dev/null | while read -r f; do
+    r=$(recent_tag "$f"); printf '%s%s\n' "$f" "$r"
+    grep -E '^import|;|exec|eval|os\.system|subprocess' "$f" 2>/dev/null | grep -vE '^import (sys|os|_virtualenv)' | head -3 | while read -r l; do nfx_flag "PTH-CODE" "$f: $l"; done
+    [ -n "$r" ] && nfx_flag "RECENT" "python hook modified within $SINCE: $f"
+  done
+
+# =========================================================================
+else # macOS
+  nfx_header "Launch Daemons / Agents"
+  plist_summary() { # plist_summary <plist>
+    local f="$1" x lbl prog args ral ka si r
+    x=$(plutil -convert xml1 -o - "$f" 2>/dev/null) || { printf '%s  (unreadable plist)\n' "$f"; return; }
+    lbl=$(printf '%s' "$x" | awk '/<key>Label<\/key>/{getline; gsub(/<\/?string>|^[[:space:]]+/,""); print; exit}')
+    prog=$(printf '%s' "$x" | awk '/<key>Program<\/key>/{getline; gsub(/<\/?string>|^[[:space:]]+/,""); print; exit}')
+    args=$(printf '%s' "$x" | awk '/<key>ProgramArguments<\/key>/{f=1; next} f&&/<\/array>/{exit} f&&/<string>/{gsub(/<\/?string>|^[[:space:]]+/,""); printf "%s ", $0}')
+    ral=$(printf '%s' "$x" | grep -A1 '<key>RunAtLoad</key>' | grep -oE '<(true|false)/>' | tr -d '<>/')
+    ka=$(printf '%s' "$x" | grep -A1 '<key>KeepAlive</key>' | grep -oE '<(true|false|dict)' | tr -d '<')
+    si=$(printf '%s' "$x" | awk '/<key>StartInterval<\/key>/{getline; gsub(/<\/?integer>|^[[:space:]]+/,""); print; exit}')
+    r=$(recent_tag "$f")
+    printf '%s%s\n    label=%s runatload=%s keepalive=%s interval=%s\n    exec: %s %s\n' "$f" "$r" "${lbl:-?}" "${ral:--}" "${ka:--}" "${si:--}" "$prog" "$args"
+    [ -n "$r" ] && nfx_flag "RECENT" "launchd plist modified within $SINCE: $f"
+    printf '%s %s' "$prog" "$args" | grep -qE "$NFX_SUSP_RE" && nfx_flag "SUSPICIOUS" "$f: $prog $args"
+    printf '%s %s' "$prog" "$args" | grep -qE '(^| )/(tmp|private/tmp|var/tmp|Users/[^/]+/(Downloads|Public|Library/Caches|\.[^/]+)|Users/Shared)/' && nfx_flag "TEMP-EXEC" "launchd item runs from temp/user-writable path: $f"
+    case "$lbl" in com.apple.*) case "$f" in /System/*) ;; *) nfx_flag "APPLE-MASQ" "non-Apple path uses com.apple.* label: $f ($lbl)";; esac ;; esac
+    # binary existence + signature
+    bin="$prog"; [ -z "$bin" ] && bin=${args%% *}
+    if [ -n "$bin" ] && [ -e "$bin" ]; then
+      sig=$(codesign -dv "$bin" 2>&1 | grep -E '^(Authority|TeamIdentifier)' | head -2 | tr '\n' ' ')
+      [ -z "$sig" ] && nfx_flag "UNSIGNED" "launchd target is unsigned: $bin (from $f)"
+    elif [ -n "$bin" ]; then nfx_flag "MISSING-BIN" "launchd target does not exist: $bin (from $f)"; fi
+    [ "$ALL" = 1 ] && printf '%s\n' "$x" | sed 's/^/    | /'
+  }
+  for d in /Library/LaunchDaemons /Library/LaunchAgents; do
+    [ -d "$d" ] || continue
+    nfx_section "$d"
+    find "$d" -maxdepth 1 -name '*.plist' 2>/dev/null | sort | while read -r f; do plist_summary "$f"; done
+  done
+  nfx_section "per-user LaunchAgents"
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    [ -d "$h/Library/LaunchAgents" ] || continue
+    find "$h/Library/LaunchAgents" -maxdepth 1 -name '*.plist' 2>/dev/null | sort | while read -r f; do printf '[user %s] ' "$u"; plist_summary "$f"; done
+  done
+  nfx_section "System launchd items modified within $SINCE (SIP-protected; should be none)"
+  find /System/Library/LaunchDaemons /System/Library/LaunchAgents -name '*.plist' -mmin -"$mins" 2>/dev/null | while read -r f; do nfx_flag "RECENT" "$f"; done
+  nfx_section "launchctl list (non-Apple, loaded)"
+  launchctl list 2>/dev/null | grep -vE '\scom\.apple\.' | head -80
+
+  nfx_header "Login items / background task management"
+  if nfx_have sfltool && nfx_is_root; then
+    nfx_section "sfltool dumpbtm (macOS 13+)"
+    sfltool dumpbtm 2>/dev/null | grep -E 'Name:|URL:|Type:|Developer Name:|Disposition:|Executable' | head -200
+  fi
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    for f in "$h/Library/Application Support/com.apple.backgroundtaskmanagementagent/backgrounditems.btm" \
+             "$h/Library/Preferences/com.apple.loginitems.plist"; do
+      [ -e "$f" ] && { printf '[user %s] ' "$u"; nfx_stat_line "$f"; }
+    done
+    for f in "$h"/Library/Preferences/ByHost/com.apple.loginwindow.*.plist; do
+      [ -e "$f" ] || continue
+      apps=$(defaults read "$f" TALAppsToRelaunchAtLogin 2>/dev/null | grep -E 'BundleID|Path' | tr -d ' ' | tr '\n' ' ')
+      [ -n "$apps" ] && printf '[user %s] relaunch-at-login: %s\n' "$u" "$apps"
+    done
+  done
+  nfx_section "osascript login items (current user)"
+  osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null
+
+  nfx_header "Login/Logout hooks (deprecated but still honoured)"
+  for k in LoginHook LogoutHook; do
+    v=$(defaults read /Library/Preferences/com.apple.loginwindow "$k" 2>/dev/null)
+    [ -n "$v" ] && nfx_flag "LOGINHOOK" "$k = $v"
+  done
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    for k in LoginHook LogoutHook; do
+      v=$(defaults read "$h/Library/Preferences/com.apple.loginwindow" "$k" 2>/dev/null)
+      [ -n "$v" ] && nfx_flag "LOGINHOOK" "user $u: $k = $v"
+    done
+  done
+
+  nfx_header "Cron / at / periodic"
+  show_file /etc/crontab
+  [ -d /usr/lib/cron/tabs ] && find /usr/lib/cron/tabs -type f 2>/dev/null | while read -r f; do show_file "$f" "user crontab $f"; done
+  [ -d /var/at/tabs ] && find /var/at/tabs -type f 2>/dev/null | while read -r f; do show_file "$f" "user crontab $f"; done
+  [ -d /var/at/jobs ] && list_dir /var/at/jobs
+  nfx_have atq && { nfx_section "atq"; atq 2>/dev/null; }
+  for d in /etc/periodic/daily /etc/periodic/weekly /etc/periodic/monthly; do list_dir "$d"; done
+  for f in /etc/periodic.conf /etc/periodic.conf.local /etc/daily.local /etc/weekly.local /etc/monthly.local; do show_file "$f"; done
+
+  nfx_header "emond / StartupItems / authorization plugins / folder actions"
+  [ -d /etc/emond.d/rules ] && { list_dir /etc/emond.d/rules; find /etc/emond.d/rules -name '*.plist' -mmin -"$mins" 2>/dev/null | while read -r f; do nfx_flag "EMOND" "emond rule modified within $SINCE: $f"; done; }
+  [ -d /private/var/db/emondClients ] && list_dir /private/var/db/emondClients
+  for d in /Library/StartupItems /System/Library/StartupItems; do
+    [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ] && { list_dir "$d"; nfx_flag "STARTUPITEMS" "legacy StartupItems present in $d"; }
+  done
+  [ -d /Library/Security/SecurityAgentPlugins ] && list_dir /Library/Security/SecurityAgentPlugins
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    [ -d "$h/Library/Scripts/Folder Action Scripts" ] && list_dir "$h/Library/Scripts/Folder Action Scripts"
+    [ -d "$h/Library/Workflows/Applications/Folder Actions" ] && list_dir "$h/Library/Workflows/Applications/Folder Actions"
+  done
+  [ -d /Library/Scripts/Folder\ Action\ Scripts ] && list_dir "/Library/Scripts/Folder Action Scripts"
+
+  nfx_header "Configuration profiles / MDM"
+  if nfx_have profiles; then
+    nfx_section "profiles list"; profiles list -all 2>/dev/null || profiles -P 2>/dev/null
+    nfx_section "enrollment"; profiles status -type enrollment 2>/dev/null
+  fi
+
+  nfx_header "Shell startup files (system)"
+  for f in /etc/profile /etc/bashrc /etc/bashrc_Apple_Terminal /etc/zshenv /etc/zprofile /etc/zshrc /etc/zshrc_Apple_Terminal /etc/zlogin /etc/zlogout /etc/csh.cshrc /etc/csh.login /etc/shells /etc/ssh/sshrc /etc/paths; do show_file "$f"; done
+  list_dir /etc/paths.d
+  list_dir /etc/profile.d
+
+  nfx_header "Dynamic linker hijacking"
+  launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null | grep -q . && nfx_flag "DYLD" "launchctl DYLD_INSERT_LIBRARIES is set: $(launchctl getenv DYLD_INSERT_LIBRARIES)"
+  grep -rlE 'DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH' /etc/profile /etc/zshenv /etc/zprofile /etc/zshrc /etc/bashrc /Library/LaunchAgents /Library/LaunchDaemons 2>/dev/null |
+    while read -r f; do nfx_flag "DYLD" "DYLD_* environment set in $f"; done
+  nfx_have kmutil && { nfx_section "loaded third-party kexts"; kmutil showloaded --list-only 2>/dev/null | grep -v com.apple; }
+  nfx_have systemextensionsctl && { nfx_section "system extensions"; systemextensionsctl list 2>/dev/null; }
+fi
+
+# ========================================================================= shared
+nfx_header "Per-user shell rc / profile files"
+nfx_user_homes | while IFS=: read -r u uid h sh; do
+  for f in .bashrc .bash_profile .bash_login .bash_logout .profile .zshrc .zprofile .zshenv .zlogin .zlogout .cshrc .tcshrc .kshrc .config/fish/config.fish .xinitrc .xsession .xprofile .Xresources .ssh/rc .pythonrc .vimrc .tmux.conf .gitconfig; do
+    [ -f "$h/$f" ] || continue
+    r=$(recent_tag "$h/$f")
+    printf '%-14s %-45s %s%s\n' "$u" "$h/$f" "$(nfx_stat_line "$h/$f" | awk '{print $1}')" "$r"
+    [ -n "$r" ] && nfx_flag "RECENT" "user $u rc file modified within $SINCE: $h/$f"
+    nfx_grep_susp "$h/$f" 5 | while read -r l; do nfx_flag "SUSPICIOUS" "$h/$f:$l"; done
+    grep -nE '^[^#]*(alias[[:space:]]+(sudo|ssh|su|passwd|ps|netstat|ss|crontab|history|top|lsof)=|PROMPT_COMMAND=|precmd|trap[[:space:]].*(DEBUG|EXIT))' "$h/$f" 2>/dev/null | head -5 |
+      while read -r l; do nfx_flag "SHELL-HOOK" "aliasing/hooking of common commands: $h/$f:$l"; done
+  done
+  for f in "$h/.config/autostart"/*.desktop; do
+    [ -f "$f" ] || continue
+    printf '%-14s autostart: %s -> %s\n' "$u" "$f" "$(grep -E '^Exec=' "$f" | head -1)"
+    grep -E '^Exec=' "$f" | grep -qE "$NFX_SUSP_RE" && nfx_flag "SUSPICIOUS" "$f: $(grep -E '^Exec=' "$f" | head -1)"
+  done
+done
+
+nfx_header "Git hooks in home/opt/srv (repository-based persistence)"
+for base in /root /home /opt /srv /Users; do
+  [ -d "$base" ] || continue
+  find "$base" -maxdepth 5 -path '*/.git/hooks/*' -type f ! -name '*.sample' -mmin -"$mins" 2>/dev/null | head -20 | while read -r f; do nfx_flag "GIT-HOOK" "git hook modified within $SINCE: $f"; done
+done
+
+nfx_findings_summary

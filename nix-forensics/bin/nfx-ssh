@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# nfx-ssh - SSH server config, authorized_keys, known_hosts, client configs and private keys
+set -u
+NFX_TOOL="nfx-ssh"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-ssh - SSH artifacts: sshd_config (effective), authorized_keys for every user, known_hosts,
+client configs (ProxyCommand/LocalCommand), private keys on disk, agent sockets, host keys.
+
+Usage: nfx-ssh [--since SPEC] [-o FILE] [--no-color]
+  --since SPEC   flag keys/configs modified within window (default 30d)
+
+ATT&CK: T1098.004 (SSH Authorized Keys), T1021.004 (Remote Services: SSH), T1552.004
+(Unsecured Credentials: Private Keys), T1563.001 (SSH Hijacking), T1556 (Modify Auth Process).
+USAGE
+}
+SINCE="30d"
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do case "$1" in --since) SINCE="$2"; shift ;; *) nfx_die "unknown option: $1";; esac; shift; done
+mins=$(nfx_since_to_minutes "$SINCE"); now=$(nfx_now_epoch)
+nfx_banner; nfx_root_hint
+recent() { local s m; s=$(nfx_stat "$1") || return 1; m=${s%%|*}; [ $(( (now - m) / 60 )) -lt "$mins" ]; }
+
+nfx_header "sshd configuration"
+for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* /private/etc/ssh/sshd_config /private/etc/ssh/sshd_config.d/*; do
+  [ -f "$f" ] || continue
+  nfx_section "$f"; nfx_stat_line "$f"
+  grep -vE '^[[:space:]]*(#|$)' "$f"
+  recent "$f" && nfx_flag "RECENT" "sshd config modified within $SINCE: $f"
+done
+if nfx_have sshd && nfx_is_root; then
+  nfx_section "effective settings (sshd -T)"
+  eff=$(sshd -T 2>/dev/null)
+  printf '%s\n' "$eff" | grep -iE '^(permitrootlogin|passwordauthentication|permitemptypasswords|pubkeyauthentication|authorizedkeysfile|authorizedkeyscommand|authorizedkeyscommanduser|usepam|allowusers|allowgroups|denyusers|port |listenaddress|permittunnel|allowtcpforwarding|gatewayports|x11forwarding|hostkey|trustedusercakeys|authorizedprincipalsfile|revokedkeys|permituserenvironment|acceptenv|kbdinteractiveauthentication|challengeresponseauthentication|maxauthtries|logingracetime|loglevel|banner|forcecommand)'
+  printf '%s\n' "$eff" | grep -qiE '^permitrootlogin yes' && nfx_flag "SSHD-ROOT" "PermitRootLogin yes"
+  printf '%s\n' "$eff" | grep -qiE '^permitemptypasswords yes' && nfx_flag "SSHD-EMPTYPW" "PermitEmptyPasswords yes"
+  printf '%s\n' "$eff" | grep -qiE '^permituserenvironment yes' && nfx_flag "SSHD-USERENV" "PermitUserEnvironment yes (LD_PRELOAD via ~/.ssh/environment)"
+  printf '%s\n' "$eff" | grep -iE '^authorizedkeyscommand ' | grep -viE 'none$' | while read -r l; do nfx_flag "SSHD-KEYCMD" "$l"; done
+  printf '%s\n' "$eff" | grep -iE '^authorizedkeysfile ' | grep -vE '\.ssh/authorized_keys( \.ssh/authorized_keys2)?$' | while read -r l; do nfx_flag "SSHD-KEYFILE" "non-default AuthorizedKeysFile: $l"; done
+  printf '%s\n' "$eff" | grep -iE '^trustedusercakeys ' | grep -viE 'none$' | while read -r l; do nfx_flag "SSHD-CA" "TrustedUserCAKeys set (certificate auth): $l"; done
+  printf '%s\n' "$eff" | grep -iE '^(usepam no|pubkeyauthentication no)' | while read -r l; do nfx_flag "SSHD-AUTH" "$l"; done
+fi
+nfx_section "sshd host keys"
+for f in /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub; do [ -f "$f" ] && nfx_stat_line "$f"; done
+for f in /etc/ssh/ssh_host_*_key; do [ -f "$f" ] && recent "$f" && nfx_flag "HOSTKEY-RECENT" "host key regenerated within $SINCE: $f"; done
+[ -f /etc/ssh/sshrc ] && { nfx_section "/etc/ssh/sshrc (runs at every SSH login)"; cat /etc/ssh/sshrc; nfx_flag "SSHRC" "/etc/ssh/sshrc exists"; }
+nfx_section "sshd service"
+if nfx_is_linux; then (systemctl is-active ssh sshd 2>/dev/null | tr '\n' ' '; echo); ps -eo pid,user,args 2>/dev/null | grep -E '[s]shd' | head -5
+else systemsetup -getremotelogin 2>/dev/null; ps -axo pid,user,args 2>/dev/null | grep -E '[s]shd|[l]aunchd.*ssh' | head -5; fi
+
+nfx_header "Per-user SSH artifacts"
+nfx_user_homes | while IFS=: read -r u uid h sh; do
+  d="$h/.ssh"; [ -d "$d" ] || continue
+  nfx_section "user=$u  $d"
+  nfx_ls_l "$d" | tail -n +2
+  recent "$d" && nfx_flag "RECENT" "user $u: ~/.ssh directory modified within $SINCE"
+  s=$(nfx_stat "$d"); ouid=$(printf '%s' "$s" | cut -d'|' -f6); [ "$ouid" != "$uid" ] && nfx_flag "SSH-OWNER" "user $u: ~/.ssh owned by uid $ouid"
+  for ak in "$d/authorized_keys" "$d/authorized_keys2"; do
+    [ -f "$ak" ] || continue
+    printf '  %s\n' "$(nfx_stat_line "$ak")"
+    recent "$ak" && nfx_flag "AUTHKEYS-RECENT" "user $u: $ak modified within $SINCE"
+    grep -vE '^[[:space:]]*(#|$)' "$ak" | while read -r line; do
+      opts=""; rest="$line"
+      case "$line" in ssh-*|ecdsa-*|sk-*) ;; *) opts=${line%% ssh-*}; opts=${opts%% ecdsa-*}; opts=${opts%% sk-*}; rest=${line#"$opts" } ;; esac
+      ktype=$(printf '%s' "$rest" | awk '{print $1}'); comment=$(printf '%s' "$rest" | awk '{ $1=""; $2=""; sub(/^  */,""); print }')
+      fp=""; nfx_have ssh-keygen && fp=$(printf '%s\n' "$rest" | ssh-keygen -lf /dev/stdin 2>/dev/null | awk '{print $2}')
+      printf '  key: type=%s fp=%s comment="%s" options="%s"\n' "$ktype" "${fp:-?}" "$comment" "$opts"
+      [ -z "$comment" ] && nfx_flag "AUTHKEY-NOCOMMENT" "user $u: authorized key with no comment (type=$ktype fp=${fp:-?})"
+      printf '%s' "$opts" | grep -qE 'command=' && nfx_flag "AUTHKEY-CMD" "user $u: forced command on key: $opts"
+      printf '%s' "$comment" | grep -qiE 'kali|parrot|root@(localhost|ubuntu|debian|kali)|hacker|pwn|backdoor|test' && nfx_flag "AUTHKEY-COMMENT" "user $u: suspicious key comment: $comment"
+    done
+    [ -L "$ak" ] && nfx_flag "AUTHKEYS-SYMLINK" "user $u: $ak is a symlink -> $(readlink "$ak")"
+  done
+  for kh in "$d/known_hosts" "$d/known_hosts2"; do
+    [ -f "$kh" ] || continue
+    n=$(grep -cvE '^[[:space:]]*(#|$)' "$kh"); hashed=$(grep -c '^|1|' "$kh")
+    printf '  known_hosts: %s entries (%s hashed)  %s\n' "$n" "$hashed" "$(nfx_stat_line "$kh" | awk '{print $1}')"
+    [ "$hashed" = 0 ] && grep -vE '^[[:space:]]*(#|$)' "$kh" | awk '{print $1}' | tr ',' '\n' | sort -u | head -40 | sed 's/^/    -> /'
+  done
+  if [ -f "$d/config" ]; then
+    printf '  config:\n'; grep -vE '^[[:space:]]*(#|$)' "$d/config" | sed 's/^/    /'
+    grep -nEi 'ProxyCommand|LocalCommand|PermitLocalCommand|RemoteCommand|ProxyJump|IdentityAgent|Match exec' "$d/config" | while read -r l; do nfx_flag "SSHCFG-CMD" "user $u: ~/.ssh/config:$l"; done
+    recent "$d/config" && nfx_flag "RECENT" "user $u: ~/.ssh/config modified within $SINCE"
+  fi
+  [ -f "$d/rc" ] && nfx_flag "SSH-RC" "user $u: ~/.ssh/rc exists (runs on every login): $(head -3 "$d/rc" | tr '\n' ';')"
+  [ -f "$d/environment" ] && nfx_flag "SSH-ENV" "user $u: ~/.ssh/environment exists: $(head -3 "$d/environment" | tr '\n' ';')"
+  find "$d" -maxdepth 1 -type f ! -name '*.pub' ! -name 'known_hosts*' ! -name 'authorized_keys*' ! -name config ! -name rc ! -name environment 2>/dev/null | while read -r k; do
+    if grep -qE 'PRIVATE KEY' "$k" 2>/dev/null; then
+      enc="unencrypted"; grep -qE 'ENCRYPTED|aes|bcrypt' "$k" 2>/dev/null && enc="encrypted"
+      nfx_have ssh-keygen && ! grep -q ENCRYPTED "$k" && ssh-keygen -y -P '' -f "$k" >/dev/null 2>&1 && enc="unencrypted(verified)"
+      printf '  private key: %s (%s) %s\n' "$k" "$enc" "$(nfx_stat_line "$k" | awk '{print $1}')"
+      recent "$k" && nfx_flag "PRIVKEY-RECENT" "user $u: private key created/modified within $SINCE: $k"
+    fi
+  done
+done
+
+nfx_header "Private keys outside ~/.ssh (T1552.004)"
+for base in /root /home /Users /etc /opt /srv /tmp /var/tmp /var/www /var/backups /dev/shm; do
+  [ -d "$base" ] || continue
+  find "$base" -xdev -maxdepth 6 -type f -size -32k \( -name 'id_*' -o -name '*.pem' -o -name '*.key' -o -name '*.ppk' -o -name '*_rsa' -o -name '*_ed25519' -o -name '*_ecdsa' \) ! -path '*/.ssh/*' ! -path '*/node_modules/*' ! -path '*/site-packages/*' 2>/dev/null |
+    while read -r k; do grep -qE 'PRIVATE KEY|PuTTY-User-Key' "$k" 2>/dev/null && { printf '%s\n' "$k"; recent "$k" && nfx_flag "PRIVKEY-RECENT" "private key outside ~/.ssh modified within $SINCE: $k"; }; done
+done | head -50
+
+nfx_header "SSH agent sockets and forwarded agents"
+ls -la /tmp/ssh-*/agent.* 2>/dev/null
+nfx_is_linux && find /tmp /run/user -maxdepth 3 -type s -name 'agent.*' 2>/dev/null | while read -r sk; do
+  owner=$(nfx_stat "$sk" | cut -d'|' -f6); printf 'agent socket %s owner uid=%s\n' "$sk" "$owner"
+done
+nfx_is_macos && ls -la /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null
+
+nfx_header "Global authorized keys / certificate authorities"
+for f in /etc/ssh/authorized_keys /etc/ssh/authorized_keys.d/* /etc/ssh/trusted-user-ca-keys.pem /etc/ssh/ca.pub /etc/ssh/revoked_keys /etc/ssh/principals/*; do
+  [ -f "$f" ] && { nfx_section "$f"; nfx_stat_line "$f"; cat "$f"; nfx_flag "GLOBAL-KEYS" "global SSH trust file present: $f"; }
+done
+
+nfx_findings_summary
