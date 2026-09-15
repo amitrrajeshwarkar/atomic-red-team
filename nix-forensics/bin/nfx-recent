@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# nfx-recent - recently modified/created files and suspicious file placements
+set -u
+NFX_TOOL="nfx-recent"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-recent - files modified, changed or created within a window, plus classic dropper locations.
+
+Usage: nfx-recent [--since SPEC] [--limit N] [--path DIR]... [--csv] [-o FILE] [--no-color]
+  --since SPEC   window: 30m 12h 7d 2w or YYYY-MM-DD (default 24h)
+  --limit N      max rows per section (default 200)
+  --path DIR     restrict scan to DIR (repeatable; default = OS-appropriate system + user dirs)
+  --csv          CSV output: kind,mtime,ctime,size,uid,mode,path
+
+Sections: modified (mtime) | metadata changed (ctime, catches chmod/chown/touch -m) |
+newly created (birth time where the OS reports it) | executables in world-writable dirs |
+hidden files/dirs in temp & root paths | regular files inside /dev | timestomp indicators
+(mtime older than birth time, or nanosecond-zeroed timestamps on Linux).
+ATT&CK: T1105 (Ingress Tool Transfer), T1036.005 (Match Legitimate Name or Location),
+T1564.001 (Hidden Files and Directories), T1070.006 (Timestomp), T1074.001 (Local Data Staging).
+USAGE
+}
+SINCE="24h"; LIMIT=200; CSV=0; PATHS=()
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) SINCE="$2"; shift ;; --limit) LIMIT="$2"; shift ;; --path) PATHS+=("$2"); shift ;; --csv) CSV=1 ;;
+    *) nfx_die "unknown option: $1" ;;
+  esac; shift
+done
+mins=$(nfx_since_to_minutes "$SINCE")
+if [ ${#PATHS[@]} -eq 0 ]; then
+  if nfx_is_macos; then PATHS=(/etc /private/etc /usr/local /opt /private/var /private/tmp /Library /Users /Applications)
+  else PATHS=(/etc /bin /sbin /usr /lib /lib64 /opt /var /tmp /dev/shm /home /root /boot /srv /run); fi
+fi
+EXIST=(); for p in "${PATHS[@]}"; do [ -e "$p" ] && EXIST+=("$p"); done
+[ ${#EXIST[@]} -eq 0 ] && nfx_die "none of the scan paths exist"
+PRUNE='( -path /proc -o -path /sys -o -path /dev/pts -o -path */node_modules -o -path */.git/objects -o -path /var/lib/docker/overlay2 -o -path /var/cache -o -path /usr/share/doc -o -path /System/Volumes -o -path */Library/Caches ) -prune -o'
+
+[ "$CSV" = 1 ] || { nfx_banner; nfx_root_hint; nfx_info "window: $SINCE ($mins min) paths: ${EXIST[*]}"; }
+[ "$CSV" = 1 ] && echo "kind,mtime,ctime,btime,size,uid,mode,path"
+
+emit() { # emit <kind> : reads NUL-separated paths on stdin, prints rows
+  local kind="$1" n=0
+  while IFS= read -r -d '' f; do
+    n=$((n+1)); [ "$n" -gt "$LIMIT" ] && { [ "$CSV" = 1 ] || printf '... (limit %s reached)\n' "$LIMIT"; break; }
+    s=$(nfx_stat "$f") || continue
+    IFS='|' read -r m a c b sz u g md ino nl p <<EOS
+$s
+EOS
+    if [ "$CSV" = 1 ]; then printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$kind" "$(nfx_epoch_to_iso "$m")" "$(nfx_epoch_to_iso "$c")" "$(nfx_epoch_to_iso "$b")" "$sz" "$u" "$md" "$(nfx_csv "$f")"
+    else printf '%s %s %8s uid=%-5s %4s %s\n' "$(nfx_epoch_to_iso "$m")" "$(nfx_epoch_to_iso "$c")" "$sz" "$u" "$md" "$f"; fi
+  done
+}
+
+[ "$CSV" = 1 ] || nfx_header "Modified within $SINCE (mtime)  [mtime ctime size uid mode path]"
+# shellcheck disable=SC2086
+find "${EXIST[@]}" -xdev $PRUNE -type f -mmin -"$mins" -print0 2>/dev/null | emit modified
+
+[ "$CSV" = 1 ] || nfx_header "Metadata changed within $SINCE but content older (ctime > mtime: chmod/chown/mv/touch -m)"
+# shellcheck disable=SC2086
+find "${EXIST[@]}" -xdev $PRUNE -type f -cmin -"$mins" ! -mmin -"$mins" -print0 2>/dev/null | emit ctime-only
+
+if nfx_is_macos || [ "$(uname -r 2>/dev/null | cut -d. -f1)" -ge 4 ] 2>/dev/null; then
+  [ "$CSV" = 1 ] || nfx_header "Timestomp indicators (mtime earlier than birth time)"
+  # shellcheck disable=SC2086
+  find "${EXIST[@]}" -xdev $PRUNE -type f -cmin -"$mins" -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    s=$(nfx_stat "$f") || continue
+    m=$(printf '%s' "$s" | cut -d'|' -f1); b=$(printf '%s' "$s" | cut -d'|' -f4)
+    case "$b" in ''|0|-) continue ;; esac
+    [ "$m" -lt "$b" ] && { if [ "$CSV" = 1 ]; then printf 'timestomp,%s,,%s,,,,%s\n' "$(nfx_epoch_to_iso "$m")" "$(nfx_epoch_to_iso "$b")" "$(nfx_csv "$f")"; else nfx_flag "TIMESTOMP" "mtime $(nfx_epoch_to_iso "$m") < birth $(nfx_epoch_to_iso "$b"): $f"; fi; }
+  done
+fi
+if nfx_is_linux && nfx_have stat; then
+  [ "$CSV" = 1 ] || nfx_header "Timestomp indicators (Linux: modified recently but mtime has zero nanoseconds)"
+  # shellcheck disable=SC2086
+  find "${EXIST[@]}" -xdev $PRUNE -type f -cmin -"$mins" -print0 2>/dev/null | xargs -0 stat -c '%y|%z|%n' 2>/dev/null |
+    awk -F'|' '{ split($1,mt," "); split($2,ct," "); split(mt[2],ms,"."); split(ct[2],cs,"."); if (ms[2]=="000000000" && cs[2]!="000000000") print $3 }' | head -"$LIMIT" |
+    while read -r f; do if [ "$CSV" = 1 ]; then printf 'timestomp-ns,,,,,,,%s\n' "$(nfx_csv "$f")"; else nfx_flag "TIMESTOMP-NS" "mtime has .000000000 ns while ctime does not (touch -d/-r?): $f"; fi; done
+fi
+
+[ "$CSV" = 1 ] || nfx_header "Executables in world-writable / temp locations"
+for d in /tmp /var/tmp /dev/shm /private/tmp /private/var/tmp /run/user /run/shm /Users/Shared /var/www/uploads; do
+  [ -d "$d" ] || continue
+  find "$d" -xdev -type f \( -perm -u+x -o -perm -g+x -o -perm -o+x \) -print0 2>/dev/null | emit temp-exec
+done
+[ "$CSV" = 1 ] || { for d in /tmp /var/tmp /dev/shm /private/tmp; do [ -d "$d" ] && find "$d" -xdev -type f -perm -o+x -mmin -"$mins" 2>/dev/null | head -20 | while read -r f; do nfx_flag "TEMP-EXEC" "executable dropped in temp dir within $SINCE: $f"; done; done; }
+
+[ "$CSV" = 1 ] || nfx_header "Hidden files/dirs in temp dirs, / and user home roots"
+for d in / /tmp /var/tmp /dev/shm /private/tmp /root /home/* /Users/* /opt /srv /var; do
+  [ -d "$d" ] || continue
+  find "$d" -mindepth 1 -maxdepth 1 -name '.*' ! -name '.bash*' ! -name '.zsh*' ! -name '.profile' ! -name '.cache' ! -name '.config' ! -name '.local' ! -name '.ssh' ! -name '.gnupg' ! -name '.viminfo' ! -name '.lesshst' ! -name '.Trash' ! -name '.DS_Store' ! -name '.CFUserTextEncoding' ! -name '.gitconfig' ! -name '.npm' ! -name '.cargo' ! -name '.rustup' ! -name '.docker' ! -name '.vim' ! -name '.wget-hsts' ! -name '.sudo_as_admin_successful' ! -name '.python_history' ! -name '.selected_editor' ! -name '.X11-unix' ! -name '.ICE-unix' ! -name '.font-unix' ! -name '.XIM-unix' ! -name '.Xauthority' ! -name '.mozilla' ! -name '.pki' ! -name '.dbus' ! -name '.gnome*' ! -name '.kde*' ! -name '.java' ! -name '.m2' ! -name '.gradle' ! -name '.pyenv' ! -name '.nvm' ! -name '.rbenv' ! -name '.bun' ! -name '.oh-my-zsh' ! -name '.vscode*' ! -name '.cursor*' ! -name '.claude*' ! -name '.aws' ! -name '.kube' ! -name '.terraform*' ! -name '.zcompdump*' ! -name '.hushlogin' ! -name '.snapshots' ! -name '.dockerenv' ! -name '.gem' ! -name '.bundle' ! -name '.ipython' ! -name '.jupyter' ! -name '.node_repl_history' ! -name '.mysql_history' ! -name '.psql_history' ! -name '.gitignore' ! -name '.zcompcache' ! -name '.Spotlight-V100' ! -name '.fseventsd' ! -name '.DocumentRevisions-V100' ! -name '.TemporaryItems' ! -name '.file' ! -name '.vol' ! -name '.PKInstallSandboxManager*' ! -name '.local' -print0 2>/dev/null | emit hidden
+done
+[ "$CSV" = 1 ] || { find /tmp /var/tmp /dev/shm /private/tmp / -mindepth 1 -maxdepth 1 \( -name '. *' -o -name '.. *' -o -name '...' -o -name '. ' -o -name '.. ' -o -name '.  ' \) 2>/dev/null | while read -r f; do nfx_flag "HIDDEN-DOTS" "classic hidden dir name: '$f'"; done; }
+
+if nfx_is_linux; then
+  [ "$CSV" = 1 ] || nfx_header "Regular files inside /dev (should be none)"
+  find /dev -xdev -type f ! -path '/dev/shm/*' ! -path '/dev/mqueue/*' ! -path '/dev/hugepages/*' -print0 2>/dev/null | emit dev-file
+  [ "$CSV" = 1 ] || find /dev -xdev -type f ! -path '/dev/shm/*' ! -path '/dev/mqueue/*' 2>/dev/null | head -10 | while read -r f; do nfx_flag "DEV-FILE" "regular file in /dev: $f"; done
+fi
+
+[ "$CSV" = 1 ] || nfx_header "Large files (>100MB) created within $SINCE in temp/home/var (staging?)"
+for d in /tmp /var/tmp /dev/shm /home /root /Users /var /opt /srv /private/tmp; do
+  [ -d "$d" ] || continue
+  find "$d" -xdev -type f -size +100M -mmin -"$mins" ! -path '*/docker/*' ! -path '*/.cache/*' ! -path '*/Library/*' -print0 2>/dev/null | emit large
+done
+[ "$CSV" = 1 ] || { find /tmp /var/tmp /dev/shm /home /root /Users /private/tmp -xdev -type f -size +100M -mmin -"$mins" \( -name '*.tar*' -o -name '*.zip' -o -name '*.7z' -o -name '*.rar' -o -name '*.gz' -o -name '*.tgz' \) 2>/dev/null | head -10 | while read -r f; do nfx_flag "STAGED-ARCHIVE" "large archive created within $SINCE: $f"; done; }
+
+[ "$CSV" = 1 ] || nfx_findings_summary

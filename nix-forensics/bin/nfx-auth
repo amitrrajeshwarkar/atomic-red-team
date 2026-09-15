@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# nfx-auth - authentication events: ssh logins, failures, sudo, su, new sessions
+set -u
+NFX_TOOL="nfx-auth"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-auth - authentication timeline: SSH logins/failures, sudo, su, session opens, account changes.
+
+Usage: nfx-auth [--since SPEC] [--top N] [-o FILE] [--no-color]
+  --since SPEC   look back window: 30m, 12h, 7d, 2w or YYYY-MM-DD (default 7d)
+  --top N        size of top-N lists (default 15)
+
+Sources (Linux): /var/log/auth.log*, /var/log/secure*, journald (sshd/sudo/su/login/systemd-logind),
+wtmp/btmp via last/lastb. Sources (macOS): unified log (sshd, sudo, su, loginwindow, screensharing,
+authorizationhost), last.
+ATT&CK: T1110 (Brute Force), T1021.004 (SSH), T1078 (Valid Accounts), T1548.003 (Sudo),
+T1136 (Create Account), T1098 (Account Manipulation), T1070.002 (Clear Linux/Mac Logs).
+USAGE
+}
+SINCE="7d"; TOP=15
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) SINCE="$2"; shift ;;
+    --top) TOP="$2"; shift ;;
+    *) nfx_die "unknown option: $1 (see --help)" ;;
+  esac; shift
+done
+mins=$(nfx_since_to_minutes "$SINCE")
+nfx_banner
+nfx_root_hint
+nfx_info "window: last $SINCE ($mins minutes)"
+
+TMP=$(nfx_mktemp)
+
+# ---------------------------------------------------------------------- gather
+if nfx_is_macos; then
+  if nfx_have log; then
+    nfx_info "reading unified log (this can take a minute)"
+    log show --last "${mins}m" --style syslog \
+      --predicate '(process == "sshd") OR (process == "sudo") OR (process == "su") OR (process == "login") OR (process == "loginwindow") OR (process == "screensharingd") OR (process == "authorizationhost") OR (process == "opendirectoryd" AND eventMessage CONTAINS "Authentication") OR (subsystem == "com.apple.securityd" AND eventMessage CONTAINS "authorization")' \
+      2>/dev/null > "$TMP"
+  fi
+  [ -r /var/log/system.log ] && nfx_read_logs /var/log/system.log 2>/dev/null | grep -E 'sshd|sudo|su\[|login\[|loginwindow' >> "$TMP"
+else
+  if nfx_have journalctl; then
+    journalctl --no-pager -q --since "-${mins}min" -o short-iso \
+      _COMM=sshd _COMM=sudo _COMM=su _COMM=login _COMM=systemd-logind _COMM=useradd _COMM=usermod _COMM=userdel _COMM=passwd _COMM=chpasswd _COMM=groupadd _COMM=gpasswd _COMM=chsh _COMM=unix_chkpwd _COMM=polkitd 2>/dev/null > "$TMP"
+  fi
+  for base in /var/log/auth.log /var/log/secure; do
+    [ -e "$base" ] && nfx_read_logs "$base" >> "$TMP"
+  done
+fi
+lines=$(wc -l < "$TMP" | tr -d ' ')
+nfx_info "collected $lines auth-related log lines (file sources are not time-filtered; journald/unified log are)"
+[ "$lines" = "0" ] && nfx_flag "NO-AUTH-LOGS" "no authentication log lines found - logs missing, unreadable or cleared?"
+
+# ---------------------------------------------------------------------- ssh
+nfx_header "SSH: successful logins"
+grep -E 'sshd.*Accepted' "$TMP" | sed -E 's/.*Accepted ([a-z-]+) for ([^ ]+) from ([^ ]+) port ([0-9]+).*/\2\t\3\t\1/' | sort | uniq -c | sort -rn | head -"$TOP" |
+  awk 'BEGIN{printf "%-6s %-20s %-40s %s\n","COUNT","USER","SOURCE","METHOD"} {printf "%-6s %-20s %-40s %s\n",$1,$2,$3,$4}'
+nfx_section "last $TOP accepted (chronological)"
+grep -E 'sshd.*Accepted' "$TMP" | tail -"$TOP"
+grep -E 'sshd.*Accepted.* for root ' "$TMP" | tail -3 | while read -r l; do nfx_flag "ROOT-SSH" "$l"; done
+
+nfx_header "SSH: failures and invalid users"
+printf 'failed password attempts : %s\n' "$(grep -cE 'sshd.*Failed (password|publickey|none)' "$TMP")"
+printf 'invalid user attempts    : %s\n' "$(grep -cE 'sshd.*[Ii]nvalid user' "$TMP")"
+nfx_section "top source IPs (failures)"
+grep -E 'sshd.*(Failed|[Ii]nvalid user)' "$TMP" | grep -oE 'from ([0-9a-fA-F.:]+)' | awk '{print $2}' | sort | uniq -c | sort -rn | head -"$TOP"
+nfx_section "top targeted usernames (failures)"
+grep -E 'sshd.*(Failed password for|[Ii]nvalid user)' "$TMP" | sed -E 's/.*(Failed password for (invalid user )?|[Ii]nvalid user )([^ ]+).*/\3/' | sort | uniq -c | sort -rn | head -"$TOP"
+grep -E 'sshd.*(Failed|[Ii]nvalid user)' "$TMP" | grep -oE 'from ([0-9a-fA-F.:]+)' | awk '{print $2}' | sort | uniq -c | awk '$1>=20{print $2" ("$1" failures)"}' |
+  while read -r l; do nfx_flag "BRUTE-FORCE" "source with many SSH failures: $l"; done
+# success following failures from same source = possible successful brute force
+grep -E 'sshd.*Accepted' "$TMP" | grep -oE 'from ([0-9a-fA-F.:]+)' | awk '{print $2}' | sort -u | while read -r ip; do
+  f=$(grep -E "sshd.*(Failed|[Ii]nvalid user).*from $ip( |$)" "$TMP" | wc -l | tr -d ' ')
+  [ "$f" -ge 5 ] && nfx_flag "BRUTE-THEN-SUCCESS" "$ip had $f failures and at least one accepted login"
+done
+
+nfx_header "sudo usage"
+nfx_section "commands run via sudo (last $TOP)"
+grep -E 'sudo(\[[0-9]+\])?:' "$TMP" | grep -E 'COMMAND=' | tail -"$TOP"
+nfx_section "sudo users (count)"
+grep -E 'sudo(\[[0-9]+\])?:' "$TMP" | grep -E 'COMMAND=' | sed -E 's/.*sudo(\[[0-9]+\])?:[[:space:]]+([^ ]+).*/\2/' | sort | uniq -c | sort -rn | head -"$TOP"
+nfx_section "sudo failures / incorrect passwords"
+grep -E 'sudo.*(incorrect password|NOT in sudoers|authentication failure|command not allowed)' "$TMP" | tail -"$TOP"
+grep -E 'sudo.*NOT in sudoers' "$TMP" | tail -5 | while read -r l; do nfx_flag "SUDO-DENIED" "$l"; done
+grep -E 'sudo.*COMMAND=.*(/bin/(ba|z|da)?sh|/usr/bin/(ba|z|da)?sh|su -| -i\b|visudo|passwd|useradd|usermod|chmod .*(777|u\+s)|/etc/sudoers|authorized_keys|nc |ncat|socat|python.* -c|base64)' "$TMP" | tail -"$TOP" |
+  while read -r l; do nfx_flag "SUDO-INTERESTING" "$l"; done
+
+nfx_header "su sessions"
+grep -E '\bsu(\[[0-9]+\])?:' "$TMP" | grep -E 'session opened|Successful su|to root|FAILED|authentication failure' | tail -"$TOP"
+grep -E '\bsu(\[[0-9]+\])?:.*(FAILED|authentication failure)' "$TMP" | wc -l | awk '$1>3{print}' | while read -r n; do nfx_flag "SU-FAILURES" "$n failed su attempts"; done
+
+nfx_header "Account changes seen in logs"
+grep -E 'useradd|usermod|userdel|groupadd|gpasswd|chpasswd|passwd(\[[0-9]+\])?:.*(changed|password for)|new user|new group|delete user|chsh' "$TMP" | tail -"$TOP" |
+  while read -r l; do printf '%s\n' "$l"; nfx_flag "ACCOUNT-CHANGE" "$l"; done
+
+nfx_header "Sessions (systemd-logind / loginwindow / screensharing)"
+grep -E 'New session|Removed session|loginwindow.*(login|logout)|screensharingd|Authentication: SUCCEEDED|Authentication: FAILED' "$TMP" | tail -"$TOP"
+
+nfx_header "wtmp/btmp"
+if nfx_have last; then
+  nfx_section "last (recent logins/reboots)"
+  if nfx_is_macos; then last | head -"$TOP"; else last -F -n "$TOP" 2>/dev/null || last -n "$TOP"; fi
+  nfx_section "still logged in"
+  last 2>/dev/null | grep -E 'still logged in|logged in' | head -"$TOP"
+fi
+if nfx_have lastb && nfx_is_root; then
+  nfx_section "lastb (failed logins from btmp)"; lastb -F -n "$TOP" 2>/dev/null | head -"$TOP"
+fi
+for f in /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/auth.log /var/log/secure /var/run/utmp /var/log/utmpx /var/log/wtmpx; do
+  [ -e "$f" ] || continue
+  sz=$(nfx_stat "$f" | cut -d'|' -f5)
+  [ "$sz" = "0" ] && nfx_flag "EMPTY-LOG" "$f is zero bytes - possibly cleared (T1070.002)"
+done
+
+nfx_findings_summary

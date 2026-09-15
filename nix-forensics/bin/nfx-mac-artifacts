@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# nfx-mac-artifacts - macOS-specific artifacts: quarantine, TCC, Gatekeeper, login items, browser history, Wi-Fi, profiles
+set -u
+NFX_TOOL="nfx-mac-artifacts"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-mac-artifacts - macOS-only artifact collection (exits on other platforms).
+
+Usage: nfx-mac-artifacts [--since SPEC] [--limit N] [--browsers] [-o FILE] [--no-color]
+  --since SPEC   window for downloads/quarantine/TCC events (default 30d)
+  --limit N      rows per table (default 50)
+  --browsers     also dump Safari/Chrome/Firefox history & downloads (needs Full Disk Access)
+
+Artifacts: LaunchServices quarantine DB (every downloaded file, source URL, agent), quarantine
+xattrs on recent files, TCC.db (system + per user: Accessibility, Full Disk Access, Screen
+Recording, Camera, Microphone, Input Monitoring grants), Gatekeeper/SIP/XProtect/firewall state,
+background task management & login items, configuration profiles / MDM, Wi-Fi known networks,
+recent items (sharedfilelist), Terminal/iTerm state, Spotlight exclusions, install.log, browser
+history & downloads, Dock persistent apps, screen sharing / remote management state.
+ATT&CK: T1553.001 (Gatekeeper Bypass), T1548.006 (TCC Manipulation), T1204.002 (User Execution),
+T1105, T1547.015 (Login Items), T1176 (Browser Extensions), T1021.005 (VNC), T1518.001.
+USAGE
+}
+SINCE="30d"; LIMIT=50; BROWSERS=0
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do case "$1" in --since) SINCE="$2"; shift ;; --limit) LIMIT="$2"; shift ;; --browsers) BROWSERS=1 ;; *) nfx_die "unknown option: $1";; esac; shift; done
+nfx_is_macos || { nfx_warn "nfx-mac-artifacts only runs on macOS (this host: $NFX_OS)"; exit 0; }
+mins=$(nfx_since_to_minutes "$SINCE"); cut=$(( $(nfx_now_epoch) - mins*60 ))
+nfx_banner; nfx_root_hint
+nfx_have sqlite3 || nfx_warn "sqlite3 not found; database artifacts will be skipped"
+cutcf=$(( cut - 978307200 ))   # Cocoa/CoreFoundation epoch offset
+sq() { # sq <db> <sql>  (copies the DB first to dodge locks / WAL)
+  local db="$1" sql="$2" t
+  [ -r "$db" ] || return 1
+  t=$(nfx_mktemp); cp "$db" "$t" 2>/dev/null || return 1
+  [ -r "$db-wal" ] && cp "$db-wal" "$t-wal" 2>/dev/null && NFX_TMPFILES="$NFX_TMPFILES $t-wal"
+  sqlite3 -separator ' | ' "$t" "$sql" 2>/dev/null
+}
+
+nfx_header "Security posture"
+printf 'SIP        : %s\n' "$(csrutil status 2>/dev/null | head -1)"
+printf 'Gatekeeper : %s\n' "$(spctl --status 2>/dev/null)"
+printf 'Firewall   : globalstate=%s stealth=%s\n' "$(defaults read /Library/Preferences/com.apple.alf globalstate 2>/dev/null)" "$(defaults read /Library/Preferences/com.apple.alf stealthenabled 2>/dev/null)"
+printf 'FileVault  : %s\n' "$(fdesetup status 2>/dev/null | head -1)"
+printf 'Remote Login (ssh): %s\n' "$(systemsetup -getremotelogin 2>/dev/null)"
+printf 'Screen Sharing/ARD: %s\n' "$(launchctl print system 2>/dev/null | grep -cE 'com.apple.screensharing|com.apple.RemoteDesktop.agent') service(s) loaded"
+printf 'XProtect   : %s  MRT: %s\n' "$(defaults read /Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Info.plist CFBundleShortVersionString 2>/dev/null)" "$(defaults read /Library/Apple/System/Library/CoreServices/MRT.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null)"
+spctl --status 2>/dev/null | grep -qi disabled && nfx_flag "GATEKEEPER-OFF" "Gatekeeper is disabled"
+csrutil status 2>/dev/null | grep -qi disabled && nfx_flag "SIP-OFF" "SIP is disabled"
+[ "$(defaults read /Library/Preferences/com.apple.alf globalstate 2>/dev/null)" = "0" ] && nfx_info "application firewall is off"
+nfx_section "Gatekeeper per-app overrides (spctl --list)"
+spctl --list 2>/dev/null | head -"$LIMIT"
+nfx_section "XProtect / MRT / XProtect Remediator recent activity"
+log show --last "${mins}m" --predicate 'subsystem == "com.apple.XProtectFramework" OR process == "XProtectRemediator" OR process == "MRT"' --style compact 2>/dev/null | grep -iE 'detect|remediat|found|malware' | tail -20
+
+nfx_header "Quarantine events (LSQuarantineEvent) since $(nfx_epoch_to_iso "$cut")"
+nfx_user_homes | while IFS=: read -r u uid h sh; do
+  db="$h/Library/Preferences/com.apple.LaunchServices.QuarantineEventsV2"; [ -r "$db" ] || continue
+  nfx_section "user=$u"
+  sq "$db" "SELECT datetime(LSQuarantineTimeStamp+978307200,'unixepoch') AS ts, LSQuarantineAgentName, LSQuarantineDataURLString, LSQuarantineOriginURLString FROM LSQuarantineEvent WHERE LSQuarantineTimeStamp > $cutcf ORDER BY ts DESC LIMIT $LIMIT"
+  sq "$db" "SELECT datetime(LSQuarantineTimeStamp+978307200,'unixepoch'), LSQuarantineAgentName, LSQuarantineDataURLString FROM LSQuarantineEvent WHERE LSQuarantineTimeStamp > $cutcf AND (LSQuarantineDataURLString LIKE '%.dmg%' OR LSQuarantineDataURLString LIKE '%.pkg%' OR LSQuarantineDataURLString LIKE '%.zip%' OR LSQuarantineDataURLString LIKE '%.sh%' OR LSQuarantineDataURLString LIKE '%.app%' OR LSQuarantineDataURLString LIKE '%.py%' OR LSQuarantineDataURLString LIKE '%.jar%')" |
+    while read -r l; do nfx_flag "DOWNLOADED-INSTALLER" "user $u: $l"; done
+  sq "$db" "SELECT LSQuarantineAgentName, count(*) FROM LSQuarantineEvent GROUP BY 1 ORDER BY 2 DESC LIMIT 15" | sed 's/^/  agent: /'
+done
+nfx_section "files still carrying com.apple.quarantine (recent, Downloads/Desktop/tmp/Applications)"
+for d in /Users/*/Downloads /Users/*/Desktop /Users/*/Documents /private/tmp /Users/Shared /Applications; do
+  [ -d "$d" ] || continue
+  find "$d" -maxdepth 2 -mmin -"$mins" \( -type f -o -name '*.app' \) 2>/dev/null | head -200 | while read -r f; do
+    q=$(xattr -p com.apple.quarantine "$f" 2>/dev/null) || continue
+    # flags;epoch-hex;agent;uuid
+    fl=${q%%;*}; rest=${q#*;}; ts=${rest%%;*}; agent=$(printf '%s' "$rest" | cut -d';' -f2)
+    printf '%-20s flags=%s agent=%-18s %s\n' "$(nfx_epoch_to_iso $((16#$ts)) 2>/dev/null)" "$fl" "$agent" "$f"
+  done
+done
+nfx_section "executables in Downloads/Desktop WITHOUT quarantine (curl/terminal fetched, or xattr stripped)"
+for d in /Users/*/Downloads /Users/*/Desktop; do
+  [ -d "$d" ] || continue
+  find "$d" -maxdepth 2 -mmin -"$mins" \( -perm -u+x -type f -o -name '*.app' -o -name '*.pkg' -o -name '*.dmg' -o -name '*.sh' -o -name '*.py' -o -name '*.command' \) 2>/dev/null | head -100 | while read -r f; do
+    xattr -p com.apple.quarantine "$f" >/dev/null 2>&1 || nfx_flag "NO-QUARANTINE" "$f"
+  done
+done
+
+nfx_header "TCC (privacy permissions)"
+tcc_dump() { # tcc_dump <db> <label>
+  local db="$1" lbl="$2"
+  [ -r "$db" ] || { nfx_info "$lbl: not readable (need root + Full Disk Access)"; return; }
+  nfx_section "$lbl"
+  sq "$db" "SELECT datetime(last_modified,'unixepoch'), service, client, CASE auth_value WHEN 0 THEN 'denied' WHEN 1 THEN 'unknown' WHEN 2 THEN 'allowed' WHEN 3 THEN 'limited' ELSE auth_value END, CASE auth_reason WHEN 1 THEN 'error' WHEN 2 THEN 'user' WHEN 3 THEN 'user' WHEN 4 THEN 'system' WHEN 5 THEN 'service-policy' WHEN 6 THEN 'MDM' WHEN 7 THEN 'override' ELSE auth_reason END FROM access ORDER BY 1 DESC LIMIT $LIMIT" 2>/dev/null ||
+  sq "$db" "SELECT service, client, allowed FROM access ORDER BY service LIMIT $LIMIT"
+  sq "$db" "SELECT datetime(last_modified,'unixepoch'), service, client FROM access WHERE auth_value=2 AND service IN ('kTCCServiceAccessibility','kTCCServiceSystemPolicyAllFiles','kTCCServiceScreenCapture','kTCCServiceListenEvent','kTCCServicePostEvent','kTCCServiceDeveloperTool','kTCCServiceMicrophone','kTCCServiceCamera','kTCCServiceAppleEvents','kTCCServiceSystemPolicySysAdminFiles')" 2>/dev/null |
+    while read -r l; do nfx_flag "TCC-SENSITIVE-GRANT" "$lbl: $l"; done
+  sq "$db" "SELECT datetime(last_modified,'unixepoch'), service, client FROM access WHERE last_modified > $cut" 2>/dev/null | while read -r l; do nfx_info "$lbl TCC change since $SINCE: $l"; done
+}
+tcc_dump "/Library/Application Support/com.apple.TCC/TCC.db" "system TCC.db"
+nfx_user_homes | while IFS=: read -r u uid h sh; do tcc_dump "$h/Library/Application Support/com.apple.TCC/TCC.db" "user $u TCC.db"; done
+
+nfx_header "Login items / Background Task Management"
+if nfx_is_root && nfx_have sfltool; then sfltool dumpbtm 2>/dev/null | grep -E '^\s*(Name|Type|Disposition|URL|Executable|Developer Name|Team Identifier|Parent Identifier)' | sed 's/^ *//' | paste -d' ' - - - - - - 2>/dev/null | head -"$LIMIT"; fi
+nfx_user_homes | while IFS=: read -r u uid h sh; do
+  for f in "$h"/Library/Application\ Support/com.apple.backgroundtaskmanagementagent/backgrounditems.btm "$h"/Library/Application\ Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.*.sfl*; do
+    [ -e "$f" ] && printf '[user %s] %s\n' "$u" "$(nfx_stat_line "$f")"
+  done
+  strings "$h/Library/Application Support/com.apple.backgroundtaskmanagementagent/backgrounditems.btm" 2>/dev/null | grep -E '^/|\.app$' | sort -u | head -20 | sed "s/^/[user $u] btm: /"
+done
+
+nfx_header "Configuration profiles / MDM"
+profiles list -all 2>/dev/null || profiles -P 2>/dev/null
+profiles status -type enrollment 2>/dev/null
+ls -la /var/db/ConfigurationProfiles/Store 2>/dev/null | tail -10
+
+nfx_header "Wi-Fi"
+iface=$(networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi|AirPort/{getline; print $2; exit}')
+[ -n "$iface" ] && { nfx_section "preferred networks ($iface)"; networksetup -listpreferredwirelessnetworks "$iface" 2>/dev/null | head -"$LIMIT"; }
+nfx_section "known networks (plist)"
+for f in /Library/Preferences/com.apple.wifi.known-networks.plist /Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist; do
+  [ -r "$f" ] || continue
+  plutil -p "$f" 2>/dev/null | grep -E '"(SSID_STR|SSID|LastConnected|AddedAt|JoinedByUserAt|LastAutoJoinAt|CaptiveProfile)"' | head -80
+done
+nfx_section "current"
+/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I 2>/dev/null | grep -E ' SSID|BSSID|channel' ; ipconfig getsummary "$iface" 2>/dev/null | grep -E 'SSID|Router' | head -3
+
+nfx_header "Recent items / user activity"
+nfx_user_homes | while IFS=: read -r u uid h sh; do
+  d="$h/Library/Application Support/com.apple.sharedfilelist"; [ -d "$d" ] || continue
+  nfx_section "user=$u recent (sharedfilelist strings)"
+  for f in "$d"/com.apple.LSSharedFileList.RecentApplications.sfl* "$d"/com.apple.LSSharedFileList.RecentDocuments.sfl* "$d"/com.apple.LSSharedFileList.RecentServers.sfl*; do
+    [ -f "$f" ] && { printf '  %s\n' "${f##*/}"; strings "$f" 2>/dev/null | grep -E '^(file:///|smb://|afp://|vnc://|ssh://|/)' | sort -u | head -15 | sed 's/^/    /'; }
+  done
+  [ -f "$h/Library/Preferences/com.apple.Terminal.plist" ] && printf '  Terminal prefs: %s\n' "$(nfx_stat_line "$h/Library/Preferences/com.apple.Terminal.plist" | awk '{print $1}')"
+  ls -t "$h/Library/Saved Application State" 2>/dev/null | head -10 | sed "s/^/  saved-state: /"
+  printf '  Dock persistent-apps: '; defaults read "$h/Library/Preferences/com.apple.dock" persistent-apps 2>/dev/null | grep -oE '"_CFURLString" = "[^"]+"' | sed -E 's/.*= "//; s/"$//' | tr '\n' ' '; echo
+  defaults read "$h/Library/Preferences/com.apple.dock" persistent-apps 2>/dev/null | grep -oE '"_CFURLString" = "[^"]+"' | grep -E 'Downloads|/tmp/|Users/Shared|\.[a-z]+/' | grep -vE '/Applications/|/System/' | while read -r l; do nfx_flag "DOCK-ODD-APP" "user $u: $l"; done
+done
+
+nfx_header "Spotlight exclusions & privacy (hiding files from search)"
+plutil -p /.Spotlight-V100/VolumeConfiguration.plist 2>/dev/null | grep -A30 Exclusions | grep -E '=> "' | head -20
+defaults read /.Spotlight-V100/VolumeConfiguration.plist Exclusions 2>/dev/null | head -20
+
+nfx_header "install.log (last $SINCE, installer/pkg activity)"
+cutdate=$(nfx_epoch_to_iso "$cut" | cut -c1-10)
+awk -v c="$cutdate" '{ if (substr($1,1,10) >= c) print }' /var/log/install.log 2>/dev/null | grep -E 'Installed|PackageKit: Install|Installer\[|installer:' | tail -"$LIMIT"
+
+if [ "$BROWSERS" = 1 ]; then
+  nfx_header "Browser history & downloads (last $SINCE)"
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    if [ -r "$h/Library/Safari/History.db" ]; then
+      nfx_section "user=$u Safari history"
+      sq "$h/Library/Safari/History.db" "SELECT datetime(v.visit_time+978307200,'unixepoch'), i.url FROM history_visits v JOIN history_items i ON i.id=v.history_item WHERE v.visit_time > $cutcf ORDER BY 1 DESC LIMIT $LIMIT"
+      nfx_section "user=$u Safari downloads"
+      plutil -p "$h/Library/Safari/Downloads.plist" 2>/dev/null | grep -E 'DownloadEntryURL|DownloadEntryPath|DownloadEntryDateFinished' | head -"$LIMIT"
+    fi
+    for cdir in "$h/Library/Application Support/Google/Chrome" "$h/Library/Application Support/BraveSoftware/Brave-Browser" "$h/Library/Application Support/Microsoft Edge" "$h/Library/Application Support/Chromium"; do
+      [ -d "$cdir" ] || continue
+      for prof in "$cdir"/Default "$cdir"/Profile\ *; do
+        [ -r "$prof/History" ] || continue
+        nfx_section "user=$u ${cdir##*/} ${prof##*/} history"
+        sq "$prof/History" "SELECT datetime(last_visit_time/1000000-11644473600,'unixepoch'), url, title FROM urls WHERE last_visit_time/1000000-11644473600 > $cut ORDER BY 1 DESC LIMIT $LIMIT"
+        nfx_section "user=$u ${cdir##*/} ${prof##*/} downloads"
+        sq "$prof/History" "SELECT datetime(start_time/1000000-11644473600,'unixepoch'), target_path, tab_url, received_bytes, CASE state WHEN 1 THEN 'complete' ELSE state END FROM downloads WHERE start_time/1000000-11644473600 > $cut ORDER BY 1 DESC LIMIT $LIMIT"
+        sq "$prof/History" "SELECT target_path FROM downloads WHERE start_time/1000000-11644473600 > $cut AND (target_path LIKE '%.dmg' OR target_path LIKE '%.pkg' OR target_path LIKE '%.sh' OR target_path LIKE '%.zip' OR target_path LIKE '%.py' OR target_path LIKE '%.jar' OR target_path LIKE '%.command')" | while read -r l; do nfx_info "user $u browser downloaded installer/script: $l"; done
+        ls "$prof/Extensions" 2>/dev/null | head -20 | sed "s/^/  extension id: /"
+      done
+    done
+    for ff in "$h"/Library/Application\ Support/Firefox/Profiles/*/places.sqlite; do
+      [ -r "$ff" ] || continue
+      nfx_section "user=$u Firefox history ($(basename "$(dirname "$ff")"))"
+      sq "$ff" "SELECT datetime(v.visit_date/1000000,'unixepoch'), p.url FROM moz_historyvisits v JOIN moz_places p ON p.id=v.place_id WHERE v.visit_date/1000000 > $cut ORDER BY 1 DESC LIMIT $LIMIT"
+    done
+  done
+fi
+
+nfx_header "Remote access / screen sharing"
+launchctl print system 2>/dev/null | grep -E 'screensharing|RemoteDesktop|ARDAgent|ssh|vnc' | head
+ls -la /Library/Preferences/com.apple.RemoteManagement.plist /Library/Application\ Support/Apple/Remote\ Desktop 2>/dev/null
+defaults read /Library/Preferences/com.apple.RemoteManagement 2>/dev/null | head -20
+nfx_findings_summary

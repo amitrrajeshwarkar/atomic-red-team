@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# nfx-hash - hash files or running-process binaries to CSV and match against known-bad lists
+set -u
+NFX_TOOL="nfx-hash"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-hash - hash files (recursively) or every running process binary; CSV output; optional
+matching against a list of known-bad hashes.
+
+Usage: nfx-hash [-a sha256|md5|sha1] [--procs] [--check HASHLIST] [--max-size MB] PATH...
+  -a ALG          hash algorithm (default sha256)
+  --procs         hash the on-disk binary of every running process (no PATH needed)
+  --check FILE    file of known-bad hashes (one per line, any of md5/sha1/sha256; comments ok);
+                  matches are printed to stderr as [!] lines and counted
+  --max-size MB   skip files larger than this (default 512)
+
+Output CSV: hash,size,mtime,path   (for --procs: hash,size,mtime,path,pid,user,cmdline)
+ATT&CK: supports IOC matching for any technique; T1036 (Masquerading) via hash vs. name.
+USAGE
+}
+ALG="sha256"; PROCS=0; CHECK=""; MAXMB=512; PATHS=()
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do
+  case "$1" in -a) ALG="$2"; shift ;; --procs) PROCS=1 ;; --check) CHECK="$2"; shift ;; --max-size) MAXMB="$2"; shift ;; -*) nfx_die "unknown option: $1" ;; *) PATHS+=("$1") ;; esac; shift
+done
+[ "$PROCS" = 1 ] || [ ${#PATHS[@]} -gt 0 ] || nfx_die "give PATH... or --procs (see --help)"
+
+hash_one() {
+  case "$ALG" in
+    sha256) nfx_sha256 "$1" ;;
+    md5) nfx_md5 "$1" ;;
+    sha1) if nfx_have sha1sum; then sha1sum "$1" 2>/dev/null | awk '{print $1}'; elif nfx_have shasum; then shasum -a 1 "$1" 2>/dev/null | awk '{print $1}'; else openssl dgst -sha1 "$1" 2>/dev/null | awk '{print $NF}'; fi ;;
+    *) nfx_die "unsupported algorithm: $ALG" ;;
+  esac
+}
+BAD=""
+if [ -n "$CHECK" ]; then
+  [ -r "$CHECK" ] || nfx_die "cannot read $CHECK"
+  BAD=$(nfx_mktemp); grep -vE '^[[:space:]]*(#|$)' "$CHECK" | tr 'A-F' 'a-f' | awk '{print $1}' | sort -u > "$BAD"
+  nfx_warn "loaded $(wc -l < "$BAD" | tr -d ' ') known-bad hashes (matching on $ALG only; rerun with -a md5/sha1 for other list types)"
+fi
+matches=0
+check() { # check <hash> <desc>
+  [ -n "$BAD" ] || return 0
+  if grep -qxF "$1" "$BAD"; then printf '%s [IOC-HASH-MATCH] %s %s\n' "$(nfx_c '1;31' '[!]')" "$1" "$2" >&2; printf '[IOC-HASH-MATCH] %s %s\n' "$1" "$2" >> "$NFX_FINDINGS_FILE"; fi
+}
+
+if [ "$PROCS" = 1 ]; then
+  echo "hash,size,mtime,path,pid,user,cmdline"
+  seen=$(nfx_mktemp)
+  if nfx_is_linux; then
+    for d in /proc/[0-9]*; do
+      exe=$(readlink "$d/exe" 2>/dev/null) || continue; [ -n "$exe" ] || continue
+      pid=${d#/proc/}; uid=$(awk '/^Uid:/{print $2}' "$d/status" 2>/dev/null); cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null | cut -c1-200)
+      target="$exe"; case "$exe" in *"(deleted)") target="$d/exe";; esac
+      h=$(hash_one "$target"); s=$(nfx_stat "$target" 2>/dev/null); sz=$(printf '%s' "$s" | cut -d'|' -f5); m=$(printf '%s' "$s" | cut -d'|' -f1)
+      printf '%s,%s,%s,%s,%s,%s,%s\n' "$h" "$sz" "$(nfx_epoch_to_iso "$m")" "$(nfx_csv "$exe")" "$pid" "$uid" "$(nfx_csv "$cmd")"
+      grep -qxF "$h" "$seen" || { printf '%s\n' "$h" >> "$seen"; check "$h" "$exe (pid $pid)"; }
+    done
+  else
+    ps -axo pid=,user=,comm= 2>/dev/null | while read -r pid user exe; do
+      [ -f "$exe" ] || continue
+      h=$(hash_one "$exe"); s=$(nfx_stat "$exe"); sz=$(printf '%s' "$s" | cut -d'|' -f5); m=$(printf '%s' "$s" | cut -d'|' -f1)
+      cmd=$(ps -o args= -p "$pid" 2>/dev/null | cut -c1-200)
+      printf '%s,%s,%s,%s,%s,%s,%s\n' "$h" "$sz" "$(nfx_epoch_to_iso "$m")" "$(nfx_csv "$exe")" "$pid" "$user" "$(nfx_csv "$cmd")"
+      grep -qxF "$h" "$seen" || { printf '%s\n' "$h" >> "$seen"; check "$h" "$exe (pid $pid)"; }
+    done
+  fi
+else
+  echo "hash,size,mtime,path"
+  find "${PATHS[@]}" -xdev -type f -size -"$((MAXMB * 1024))"k -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    h=$(hash_one "$f"); s=$(nfx_stat "$f") || continue; sz=$(printf '%s' "$s" | cut -d'|' -f5); m=$(printf '%s' "$s" | cut -d'|' -f1)
+    printf '%s,%s,%s,%s\n' "$h" "$sz" "$(nfx_epoch_to_iso "$m")" "$(nfx_csv "$f")"
+    check "$h" "$f"
+  done
+fi
+if [ -n "$BAD" ]; then n=$(grep -c 'IOC-HASH-MATCH' "$NFX_FINDINGS_FILE" 2>/dev/null); nfx_warn "known-bad hash matches: ${n:-0}"; fi

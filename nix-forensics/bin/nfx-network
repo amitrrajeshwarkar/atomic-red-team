@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# nfx-network - sockets, connections, DNS/hosts, firewall, promiscuous interfaces, proxies
+set -u
+NFX_TOOL="nfx-network"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-network - listening sockets, connections with owning process, ARP, routes, DNS, hosts,
+firewall state, promiscuous interfaces, proxy settings, raw sockets.
+
+Usage: nfx-network [-o FILE] [--no-color]
+
+Flags: listeners/connections owned by processes in temp paths, connections to classic
+C2/backdoor/miner ports, promiscuous interfaces (T1040), non-local /etc/hosts entries
+(T1565.001), proxy env vars (T1090), raw/packet sockets, unusual DNS servers, IRC/tor ports.
+ATT&CK: T1049 (System Network Connections Discovery), T1071 (Application Layer Protocol),
+T1571 (Non-Standard Port), T1090 (Proxy), T1040 (Network Sniffing), T1095 (Non-App Layer Protocol).
+USAGE
+}
+nfx_std_args "$@"
+nfx_banner
+nfx_root_hint
+
+BAD_PORTS_RE=':(4444|4445|1337|31337|6666|6667|6697|9001|9030|9050|9051|3333|4443|5555|7777|8888|14444|45700|1080|2222|1234|12345|54321|9999|6000|3389|5900|23)$'
+
+nfx_header "Interfaces"
+if nfx_is_macos; then ifconfig 2>/dev/null | grep -E '^[a-z]|inet |ether |PROMISC'
+else (ip -br addr 2>/dev/null || ifconfig -a 2>/dev/null); fi
+if nfx_is_linux && nfx_have ip; then
+  ip -o link show 2>/dev/null | grep -E 'PROMISC' | awk '{print $2}' | while read -r i; do nfx_flag "PROMISC" "interface in promiscuous mode: ${i%:} (sniffer?)"; done
+else
+  ifconfig 2>/dev/null | awk '/^[a-z]/{i=$1} /PROMISC/{print i}' | while read -r i; do nfx_flag "PROMISC" "interface in promiscuous mode: ${i%:}"; done
+fi
+
+nfx_header "Listening sockets"
+if nfx_is_macos; then
+  lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null; lsof -nP -iUDP 2>/dev/null | head -60
+  LISTEN=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $1"|"$2"|"$3"|"$9}')
+elif nfx_have ss; then
+  ss -tulpen 2>/dev/null
+  LISTEN=$(ss -tulpnH 2>/dev/null | awk '{print $NF"|"$5}')
+elif nfx_have netstat; then
+  netstat -tulpen 2>/dev/null
+  LISTEN=$(netstat -tulpn 2>/dev/null | awk 'NR>2{print $NF"|"$4}')
+else
+  nfx_section "/proc/net/tcp (raw, listeners)"
+  awk 'NR>1 && $4=="0A"{split($2,a,":"); printf "0x%s -> port %d\n",a[1],strtonum("0x"a[2])}' /proc/net/tcp 2>/dev/null || awk 'NR>1 && $4=="0A"{print $2}' /proc/net/tcp
+  LISTEN=""
+fi
+printf '%s\n' "$LISTEN" | grep -E "$BAD_PORTS_RE" | while read -r l; do nfx_flag "ODD-LISTEN-PORT" "listener on a port commonly used by backdoors/miners/tor: $l"; done
+
+nfx_header "Established / active connections"
+if nfx_is_macos; then
+  lsof -nP -iTCP -sTCP:ESTABLISHED 2>/dev/null
+  CONN=$(lsof -nP -iTCP -sTCP:ESTABLISHED 2>/dev/null | awk 'NR>1{print $1"|"$2"|"$3"|"$9}')
+elif nfx_have ss; then
+  ss -tupn state established 2>/dev/null; ss -tupn state syn-sent 2>/dev/null | tail -n +2
+  CONN=$(ss -tupnH state established 2>/dev/null | awk '{print $NF"|"$4"|"$5}')
+elif nfx_have netstat; then
+  netstat -tupn 2>/dev/null | grep -E 'ESTABLISHED|SYN_SENT'
+  CONN=$(netstat -tupn 2>/dev/null | grep ESTABLISHED | awk '{print $NF"|"$4"|"$5}')
+else CONN=""; fi
+printf '%s\n' "$CONN" | grep -E "$BAD_PORTS_RE" | while read -r l; do nfx_flag "ODD-REMOTE-PORT" "connection to a port commonly used by backdoors/miners/tor/IRC: $l"; done
+printf '%s\n' "$CONN" | grep -E '(^|[^0-9])(nc|ncat|socat|telnet|python[0-9.]*|perl|ruby|php|bash|sh|dash|zsh)[|"]' | while read -r l; do nfx_flag "SHELL-WITH-SOCKET" "interpreter/shell/netcat holds a network connection: $l"; done
+nfx_section "remote peers (count)"
+printf '%s\n' "$CONN" | awk -F'|' '{print $NF}' | sed -E 's/:[0-9]+$//' | sort | uniq -c | sort -rn | head -20
+
+nfx_header "Sockets owned by processes running from temp/home paths"
+if nfx_is_linux; then
+  for d in /proc/[0-9]*; do
+    exe=$(readlink "$d/exe" 2>/dev/null) || continue
+    printf '%s' "$exe" | grep -qE '^/(tmp|dev/shm|var/tmp|home|root|run/user)/' || continue
+    n=$(ls -l "$d/fd" 2>/dev/null | grep -c 'socket:')
+    [ "$n" -gt 0 ] && nfx_flag "TEMP-PROC-SOCKET" "pid ${d#/proc/} exe=$exe holds $n socket(s)"
+  done
+else
+  lsof -nP -i 2>/dev/null | awk 'NR>1{print $2}' | sort -u | while read -r p; do
+    exe=$(ps -o comm= -p "$p" 2>/dev/null)
+    printf '%s' "$exe" | grep -qE '^/(private/)?(tmp|var/tmp)/|^/Users/[^/]+/(Downloads|Library/Caches|\.)|^/Users/Shared' && nfx_flag "TEMP-PROC-SOCKET" "pid $p exe=$exe has network sockets"
+  done
+fi
+
+nfx_header "Raw / packet sockets (sniffers)"
+if nfx_is_linux; then
+  if nfx_have ss; then ss -0pn 2>/dev/null | tail -n +2 | while read -r l; do nfx_flag "RAW-SOCKET" "$l"; done
+  else grep -v 'sk' /proc/net/packet 2>/dev/null | while read -r l; do nfx_flag "RAW-SOCKET" "/proc/net/packet: $l"; done; fi
+  awk 'NR>1{print}' /proc/net/raw 2>/dev/null | head -5
+else
+  lsof -nP 2>/dev/null | grep -E 'bpf|/dev/bpf' | head -10 | while read -r l; do nfx_flag "BPF-DEVICE" "process has a BPF device open (sniffer?): $l"; done
+fi
+
+nfx_header "ARP / neighbours"
+if nfx_is_linux && nfx_have ip; then ip neigh 2>/dev/null; else arp -an 2>/dev/null; fi
+(ip neigh 2>/dev/null || arp -an 2>/dev/null) | grep -oE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | sort | uniq -d | while read -r m; do nfx_flag "ARP-DUP-MAC" "MAC $m maps to multiple IPs (ARP spoofing / proxy ARP?)"; done
+
+nfx_header "Routing"
+if nfx_is_macos; then netstat -rn 2>/dev/null | head -40; else (ip route 2>/dev/null; ip -6 route 2>/dev/null | head -10) || route -n 2>/dev/null; ip rule 2>/dev/null; fi
+
+nfx_header "DNS"
+nfx_cat_if /etc/resolv.conf
+nfx_is_linux && nfx_have resolvectl && { nfx_section "resolvectl status"; resolvectl status 2>/dev/null | head -40; }
+nfx_is_macos && { nfx_section "scutil --dns"; scutil --dns 2>/dev/null | grep -E 'resolver|nameserver|domain' | head -30; }
+nfx_cat_if /etc/nsswitch.conf | grep -E '^hosts' 
+grep -E '^hosts' /etc/nsswitch.conf 2>/dev/null | grep -qvE '^hosts:[[:space:]]+(files|dns|myhostname|mdns|resolve|\[|[[:space:]])+$' && nfx_flag "NSSWITCH" "unusual hosts resolution order: $(grep -E '^hosts' /etc/nsswitch.conf)"
+
+nfx_header "/etc/hosts"
+grep -vE '^[[:space:]]*(#|$)' /etc/hosts 2>/dev/null
+nfx_stat_line /etc/hosts
+grep -vE '^[[:space:]]*(#|$)' /etc/hosts 2>/dev/null | grep -vE '^(127\.|::1|fe80::|ff0[0-9]::|255\.255|0\.0\.0\.0)' | grep -vE "[[:space:]]$(hostname 2>/dev/null)([[:space:]]|$)" |
+  while read -r l; do nfx_flag "HOSTS-ENTRY" "non-loopback /etc/hosts entry (redirect/blocking?): $l"; done
+grep -E '^[[:space:]]*(0\.0\.0\.0|127\.0\.0\.1)[[:space:]]+.*(update|antivirus|security|microsoft|apple|google|clamav|virustotal|sophos|crowdstrike|sentinel|defender)' /etc/hosts 2>/dev/null |
+  while read -r l; do nfx_flag "HOSTS-BLOCK" "security/update domain blackholed in /etc/hosts: $l"; done
+
+nfx_header "Proxy settings"
+env | grep -iE '^(http|https|ftp|all|no)_proxy='
+env | grep -iE '^(http|https|ftp|all)_proxy=' | while read -r l; do nfx_flag "PROXY-ENV" "$l"; done
+grep -hiE 'proxy' /etc/environment /etc/profile /etc/profile.d/* /etc/apt/apt.conf /etc/apt/apt.conf.d/* /etc/yum.conf /etc/dnf/dnf.conf 2>/dev/null | grep -vE '^[[:space:]]*#' | head -10
+nfx_is_macos && { nfx_section "scutil --proxy"; scutil --proxy 2>/dev/null; }
+
+nfx_header "Firewall"
+if nfx_is_macos; then
+  printf 'ALF globalstate: %s (0=off,1=on,2=block all)\n' "$(defaults read /Library/Preferences/com.apple.alf globalstate 2>/dev/null)"
+  /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null
+  /usr/libexec/ApplicationFirewall/socketfilterfw --listapps 2>/dev/null | head -60
+  nfx_is_root && { nfx_section "pf rules"; pfctl -sr 2>/dev/null | head -60; pfctl -s info 2>/dev/null | head -3; }
+else
+  if nfx_have nft; then nfx_section "nft list ruleset"; nft list ruleset 2>/dev/null | head -150; fi
+  if nfx_have iptables; then nfx_section "iptables -S"; iptables -S 2>/dev/null | head -100; iptables -t nat -S 2>/dev/null | grep -vE '^-P' | head -40; fi
+  nfx_have ufw && { nfx_section "ufw"; ufw status verbose 2>/dev/null; }
+  nfx_have firewall-cmd && { nfx_section "firewalld"; firewall-cmd --list-all 2>/dev/null; }
+  iptables -t nat -S 2>/dev/null | grep -E 'REDIRECT|DNAT' | while read -r l; do nfx_flag "NAT-REDIRECT" "traffic redirection rule: $l"; done
+fi
+
+nfx_header "Network-related kernel settings"
+if nfx_is_linux; then
+  for k in net.ipv4.ip_forward net.ipv4.conf.all.accept_redirects net.ipv4.conf.all.send_redirects net.ipv4.conf.all.rp_filter; do
+    v=$(sysctl -n "$k" 2>/dev/null); printf '%-40s = %s\n' "$k" "$v"
+  done
+  [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ] && nfx_info "IP forwarding is enabled (router/container host, or pivot?)"
+else
+  sysctl net.inet.ip.forwarding 2>/dev/null
+fi
+
+nfx_header "Shares / remote access services"
+[ -s /etc/exports ] && { nfx_section "/etc/exports (NFS)"; grep -vE '^[[:space:]]*(#|$)' /etc/exports; }
+[ -f /etc/samba/smb.conf ] && { nfx_section "samba shares"; grep -E '^\[|path|guest' /etc/samba/smb.conf | grep -v '^;' | head -30; }
+nfx_is_macos && { nfx_section "sharing state"; systemsetup -getremotelogin 2>/dev/null; launchctl print system 2>/dev/null | grep -E 'screensharing|RemoteDesktop|smbd|ssh' | head; }
+
+nfx_findings_summary
