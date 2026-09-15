@@ -19,6 +19,9 @@ nix-forensics/
 └── install.sh     symlink the tools into /usr/local/bin (optional)
 ```
 
+New to Linux forensics? Read **[docs/LINUX-FORENSICS-GUIDE.md](docs/LINUX-FORENSICS-GUIDE.md)**
+first: installation in three steps, a first run, and simple scenario-by-scenario examples.
+
 ## Quick start
 
 ```bash
