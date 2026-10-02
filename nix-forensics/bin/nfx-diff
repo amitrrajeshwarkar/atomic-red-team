@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# nfx-diff - compare two triage outputs or inventories and show what changed
+set -u
+NFX_TOOL="nfx-diff"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-diff - compare two nfx outputs (files or whole triage directories) and report what changed.
+
+Usage: nfx-diff [--ignore REGEX] [--flags-only] BASELINE CURRENT
+  BASELINE/CURRENT   two files, or two directories produced by nfx-triage
+  --ignore REGEX     drop lines matching REGEX before comparing (default ignores banner/utc lines,
+                     PIDs, uptime, load, etime and 'now' timestamps)
+  --flags-only       compare only [!] finding lines (fast triage of "what is new")
+
+Use it to diff a known-good baseline against a suspect host, or the same host before/after.
+USAGE
+}
+IGN='^nfx-[a-z-]+ v[0-9.]+ \||utc=|uptime|load average|^now |^\[\*\] (probing|window|collected|entries|paths|scanning|loaded|compared)|etime|^ *[0-9]+ +[0-9]+ .* (S|R|Z|D|T)s? |pid=[0-9]+|PID [0-9]+|^total [0-9]+'
+FLAGS=0; POS=()
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do case "$1" in --ignore) IGN="$2"; shift ;; --flags-only) FLAGS=1 ;; -*) nfx_die "unknown option: $1";; *) POS+=("$1");; esac; shift; done
+[ ${#POS[@]} -eq 2 ] || nfx_die "need BASELINE and CURRENT (see --help)"
+A="${POS[0]}"; B="${POS[1]}"; [ -e "$A" ] && [ -e "$B" ] || nfx_die "both paths must exist"
+
+norm() { # norm <file> -> normalised content on stdout
+  if [ "$FLAGS" = 1 ]; then grep -E '^\[!\]|^\[[A-Z0-9-]+\] ' "$1" 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g' | sort -u
+  else sed -E 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null | grep -vE "$IGN" | sort -u; fi
+}
+diff_pair() { # diff_pair <a> <b> <label>
+  local a b; a=$(nfx_mktemp); b=$(nfx_mktemp); norm "$1" > "$a"; norm "$2" > "$b"
+  local added removed; added=$(comm -13 "$a" "$b" | wc -l | tr -d ' '); removed=$(comm -23 "$a" "$b" | wc -l | tr -d ' ')
+  if [ "$added" = 0 ] && [ "$removed" = 0 ]; then printf '%-28s unchanged\n' "$3"; return; fi
+  nfx_section "$3  (+$added / -$removed)"
+  comm -13 "$a" "$b" | sed 's/^/+ /' | head -200
+  comm -23 "$a" "$b" | sed 's/^/- /' | head -200
+  comm -13 "$a" "$b" | grep -E '^\[!\]|^\[[A-Z0-9-]+\] ' | head -50 | while read -r l; do nfx_flag "NEW-FINDING" "$3: $l"; done
+}
+nfx_banner
+nfx_info "baseline=$A current=$B"
+if [ -d "$A" ] && [ -d "$B" ]; then
+  for f in "$A"/*.txt; do
+    n=${f##*/}; [ "$n" = "manifest.csv" ] && continue
+    if [ -f "$B/$n" ]; then diff_pair "$f" "$B/$n" "$n"; else printf '%-28s missing in current\n' "$n"; fi
+  done
+  for f in "$B"/*.txt; do n=${f##*/}; [ -f "$A/$n" ] || printf '%-28s new in current\n' "$n"; done
+else
+  diff_pair "$A" "$B" "$(basename "$A") vs $(basename "$B")"
+fi
+nfx_findings_summary

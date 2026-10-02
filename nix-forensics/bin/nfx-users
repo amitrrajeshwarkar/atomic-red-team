@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# nfx-users - local accounts, groups, sudoers and privilege anomalies
+set -u
+NFX_TOOL="nfx-users"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-users - local accounts, groups, sudo rights, password state and privilege anomalies.
+
+Usage: nfx-users [-o FILE] [--no-color]
+
+Flags: extra UID-0 accounts, duplicate UIDs, system accounts with login shells,
+empty/locked password states, recently changed passwords, NOPASSWD sudo rules,
+hidden macOS users, admin-group membership, recently modified account databases.
+ATT&CK: T1136.001 (Create Account: Local), T1078.003 (Valid Accounts: Local),
+T1098 (Account Manipulation), T1548.003 (Sudo and Sudo Caching).
+USAGE
+}
+nfx_std_args "$@"
+nfx_banner
+nfx_root_hint
+
+now=$(nfx_now_epoch)
+
+nfx_header "Account database timestamps"
+for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers /etc/master.passwd /etc/login.defs /etc/security/opasswd; do
+  [ -e "$f" ] && nfx_stat_line "$f"
+done
+if nfx_is_macos; then
+  for f in /var/db/dslocal/nodes/Default/users/*.plist; do
+    [ -e "$f" ] || continue
+    s=$(nfx_stat "$f"); m=${s%%|*}
+    if [ $((now - m)) -lt 2592000 ]; then
+      nfx_flag "RECENT-ACCOUNT" "user record modified in last 30d: $(nfx_stat_line "$f")"
+    fi
+  done
+fi
+
+nfx_header "Accounts"
+if nfx_is_macos; then
+  printf '%-20s %-6s %-6s %-30s %s\n' USER UID GID HOME SHELL
+  dscl . -list /Users UniqueID 2>/dev/null | while read -r u uid; do
+    gid=$(dscl . -read "/Users/$u" PrimaryGroupID 2>/dev/null | awk '{print $2}')
+    home=$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    sh=$(dscl . -read "/Users/$u" UserShell 2>/dev/null | awk '{print $2}')
+    printf '%-20s %-6s %-6s %-30s %s\n' "$u" "$uid" "$gid" "$home" "$sh"
+    [ "$uid" = "0" ] && [ "$u" != "root" ] && nfx_flag "UID0" "account '$u' has UID 0"
+    hidden=$(dscl . -read "/Users/$u" IsHidden 2>/dev/null | awk '{print $2}')
+    [ "$hidden" = "1" ] && nfx_flag "HIDDEN-USER" "account '$u' is hidden from the login window (IsHidden=1)"
+    if [ "$uid" -ge 500 ] 2>/dev/null; then
+      case "$u" in _*) nfx_flag "ODD-NAME" "underscore-prefixed (service-style) name with user UID: $u ($uid)";; esac
+    fi
+  done
+  dscl . -list /Users UniqueID 2>/dev/null | awk '{print $2}' | sort | uniq -d | while read -r d; do
+    nfx_flag "DUP-UID" "UID $d is shared by more than one account"
+  done
+  nfx_section "Admin group members"
+  dscl . -read /Groups/admin GroupMembership 2>/dev/null
+  nfx_section "Wheel group members"
+  dscl . -read /Groups/wheel GroupMembership 2>/dev/null
+  nfx_section "Root account status"
+  dscl . -read /Users/root AuthenticationAuthority 2>/dev/null | grep -q 'ShadowHash' &&
+    nfx_flag "ROOT-ENABLED" "root account has a password set (enabled) - unusual on macOS"
+  nfx_section "Guest / auto-login"
+  defaults read /Library/Preferences/com.apple.loginwindow 2>/dev/null | grep -iE 'GuestEnabled|autoLoginUser|SHOWFULLNAME|HiddenUsersList' | sed 's/^/  /'
+  al=$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)
+  [ -n "$al" ] && nfx_flag "AUTOLOGIN" "automatic login enabled for user '$al'"
+else
+  pw=$( (nfx_have getent && getent passwd) 2>/dev/null || cat /etc/passwd)
+  printf '%-20s %-6s %-6s %-28s %-22s %s\n' USER UID GID HOME SHELL GECOS
+  printf '%s\n' "$pw" | awk -F: '{printf "%-20s %-6s %-6s %-28s %-22s %s\n",$1,$3,$4,$6,$7,$5}'
+  printf '%s\n' "$pw" | awk -F: '$3==0 && $1!="root"{print $1}' | while read -r u; do nfx_flag "UID0" "account '$u' has UID 0"; done
+  printf '%s\n' "$pw" | awk -F: '{print $3}' | sort | uniq -d | while read -r d; do
+    nfx_flag "DUP-UID" "UID $d shared by: $(printf '%s\n' "$pw" | awk -F: -v d="$d" '$3==d{print $1}' | tr '\n' ' ')"
+  done
+  printf '%s\n' "$pw" | awk -F: '$3<1000 && $3!=0 && $7 !~ /(nologin|false|sync|halt|shutdown|\/bin\/true)$/ {print $1" uid="$3" shell="$7}' |
+    while read -r l; do nfx_flag "SYSTEM-SHELL" "system account with an interactive shell: $l"; done
+  printf '%s\n' "$pw" | awk -F: '$6 ~ /^\/(tmp|var\/tmp|dev)/ {print $1" home="$6}' |
+    while read -r l; do nfx_flag "ODD-HOME" "account with home in a temp/dev path: $l"; done
+  printf '%s\n' "$pw" | awk -F: '$1 ~ /^[[:space:]]|[[:space:]]$/ || $1 ~ /[^a-zA-Z0-9._@-]/ {print $1}' |
+    while read -r l; do nfx_flag "ODD-NAME" "account name with unusual characters: '$l'"; done
+
+  nfx_header "Password state (/etc/shadow)"
+  if [ -r /etc/shadow ]; then
+    printf '%-20s %-10s %-12s %s\n' USER STATE LASTCHANGE NOTE
+    awk -F: -v now="$(( now / 86400 ))" '
+      { state="hash"; note="";
+        if ($2=="") { state="EMPTY" }
+        else if ($2 ~ /^[!*]/) { state="locked" }
+        else if ($2 ~ /^\$/) { state="hash" }
+        if ($3=="") lc="never"; else { lc=$3; if (now-$3 < 30) note="changed <30d ago" }
+        printf "%-20s %-10s %-12s %s\n",$1,state,lc,note }' /etc/shadow
+    awk -F: '$2==""{print $1}' /etc/shadow | while read -r u; do nfx_flag "EMPTY-PASSWORD" "account '$u' has an empty password field"; done
+    awk -F: -v now="$(( now / 86400 ))" '$2 ~ /^\$/ && $3!="" && now-$3 < 30 {print $1" ("now-$3"d ago)"}' /etc/shadow |
+      while read -r l; do nfx_flag "RECENT-PASSWD" "password changed recently: $l"; done
+    awk -F: '$2 ~ /^\$/ && $1!="root"' /etc/shadow | awk -F: '{print $1}' | while read -r u; do
+      uid=$(printf '%s\n' "$pw" | awk -F: -v u="$u" '$1==u{print $3}')
+      [ -n "$uid" ] && [ "$uid" -lt 1000 ] && nfx_flag "SYSTEM-PASSWD" "system account '$u' (uid $uid) has a password hash set"
+    done
+  else
+    nfx_info "/etc/shadow not readable (need root)"
+  fi
+
+  nfx_header "Privileged groups"
+  for g in root sudo wheel admin adm docker lxd disk shadow video staff systemd-journal; do
+    m=$( (nfx_have getent && getent group "$g") 2>/dev/null || grep "^$g:" /etc/group 2>/dev/null)
+    [ -n "$m" ] && printf '%s\n' "$m"
+  done
+  printf '%s\n' "$pw" | awk -F: '$4==0 && $1!="root"{print $1}' | while read -r u; do nfx_flag "GID0" "account '$u' has primary group 0"; done
+
+  nfx_header "Login history"
+  if nfx_have lastlog; then nfx_section "lastlog (accounts that have logged in)"; lastlog 2>/dev/null | grep -v 'Never logged in'; fi
+fi
+
+nfx_header "Sudo configuration"
+for f in /etc/sudoers /etc/sudoers.d/* /private/etc/sudoers /private/etc/sudoers.d/*; do
+  [ -f "$f" ] || continue
+  nfx_section "$f ($(nfx_stat_line "$f" | awk '{print $1}'))"
+  grep -vE '^\s*(#|$)' "$f" 2>/dev/null
+  grep -nE 'NOPASSWD' "$f" 2>/dev/null | while read -r l; do nfx_flag "SUDO-NOPASSWD" "$f:$l"; done
+  grep -nE '^\s*[^#%[:space:]]+\s+ALL\s*=\s*\(ALL(:ALL)?\)\s+ALL' "$f" 2>/dev/null | grep -vE '^\s*[0-9]+:\s*root\s' |
+    while read -r l; do nfx_flag "SUDO-ALL" "full sudo for a user: $f:$l"; done
+  grep -nE '^\s*Defaults.*(env_keep|!requiretty|!authenticate|timestamp_timeout=-1)' "$f" 2>/dev/null |
+    while read -r l; do nfx_flag "SUDO-DEFAULTS" "weakened sudo defaults: $f:$l"; done
+  s=$(nfx_stat "$f"); m=${s%%|*}
+  [ $((now - m)) -lt 2592000 ] && nfx_flag "SUDO-RECENT" "$f modified in the last 30 days"
+done
+[ -e /etc/sudoers.d ] && { nfx_section "/etc/sudoers.d listing"; nfx_ls_l /etc/sudoers.d; }
+
+nfx_header "Home directories"
+minuid=1000; nfx_is_macos && minuid=500
+nfx_user_homes | while IFS=: read -r u uid h sh; do
+  [ "$uid" = "0" ] || [ "$uid" -ge "$minuid" ] 2>/dev/null || continue
+  [ -L "$h" ] && continue
+  s=$(nfx_stat "$h") || continue
+  IFS='|' read -r m a c b sz ouid ogid md ino nl p <<EOS
+$s
+EOS
+  note=""
+  [ "$ouid" != "$uid" ] && note="$note owner-uid=$ouid!=$uid"
+  case "$md" in *[2367]) note="$note world-writable" ;; esac
+  printf '%-18s uid=%-6s mtime=%s mode=%s %s%s\n' "$u" "$uid" "$(nfx_epoch_to_iso "$m")" "$md" "$h" "$note"
+  [ -n "$note" ] && nfx_flag "HOME-PERMS" "$u: $h ->$note"
+done
+
+nfx_header "Currently logged in"
+who -a 2>/dev/null || who 2>/dev/null
+nfx_findings_summary

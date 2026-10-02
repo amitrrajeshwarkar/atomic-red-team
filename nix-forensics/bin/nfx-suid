@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# nfx-suid - SUID/SGID binaries and file capabilities vs a known-good baseline
+set -u
+NFX_TOOL="nfx-suid"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-suid - inventory SUID/SGID binaries and Linux file capabilities; flag unexpected ones.
+
+Usage: nfx-suid [--baseline FILE] [--save FILE] [--compare FILE] [--path DIR]... [-o FILE]
+  --baseline FILE  basename allow-list (default: data/suid-baseline.txt in the toolkit)
+  --save FILE      write the full inventory (sha256|mode|uid|gid|mtime|path) to FILE
+  --compare FILE   diff current inventory against a previously --save'd FILE (added/removed/changed)
+  --path DIR       restrict scan (default: / with -xdev; macOS skips /System and /Volumes)
+
+Flags: SUID/SGID files whose basename is not in the baseline, SUID files in temp/home/opt/srv,
+SUID shells/interpreters (bash, sh, python, perl, find, vim, nmap...), world-writable SUID files,
+SUID files modified in the last 30 days, capabilities cap_setuid/cap_sys_admin/cap_dac_override/
+cap_sys_ptrace/cap_net_raw on unexpected binaries.
+ATT&CK: T1548.001 (Setuid and Setgid), T1068 (Exploitation for Privilege Escalation).
+USAGE
+}
+BASE="$NFX_BIN_DIR/../data/suid-baseline.txt"; SAVE=""; COMPARE=""; PATHS=()
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --baseline) BASE="$2"; shift ;; --save) SAVE="$2"; shift ;; --compare) COMPARE="$2"; shift ;; --path) PATHS+=("$2"); shift ;;
+    *) nfx_die "unknown option: $1" ;;
+  esac; shift
+done
+[ ${#PATHS[@]} -eq 0 ] && PATHS=(/)
+nfx_banner; nfx_root_hint
+now=$(nfx_now_epoch)
+INV=$(nfx_mktemp)
+PRUNE="-path /proc -prune -o -path /sys -prune -o -path /dev -prune -o -path /System -prune -o -path /Volumes -prune -o -path /var/lib/docker -prune -o"
+
+nfx_header "SUID / SGID inventory"
+# shellcheck disable=SC2086
+find "${PATHS[@]}" -xdev $PRUNE -type f \( -perm -4000 -o -perm -2000 \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
+  s=$(nfx_stat "$f") || continue
+  IFS='|' read -r m a c b sz u g md ino nl p <<EOS
+$s
+EOS
+  h=$(nfx_sha256 "$f")
+  printf '%s|%s|%s|%s|%s|%s\n' "$h" "$md" "$u" "$g" "$(nfx_epoch_to_iso "$m")" "$f" >> "$INV"
+done
+sort -t'|' -k6 "$INV" | awk -F'|' 'BEGIN{printf "%-6s %-5s %-5s %-20s %-66s %s\n","MODE","UID","GID","MTIME","SHA256","PATH"} {printf "%-6s %-5s %-5s %-20s %s %s\n",$2,$3,$4,$5,$1,$6}'
+nfx_info "$(wc -l < "$INV" | tr -d ' ') SUID/SGID files found"
+
+nfx_header "Analysis"
+if [ -r "$BASE" ]; then
+  nfx_info "baseline: $BASE"
+  while IFS='|' read -r h md u g mt f; do
+    bn=${f##*/}
+    grep -vE '^[[:space:]]*(#|$)' "$BASE" | grep -qxF "$bn" || nfx_flag "UNEXPECTED-SUID" "not in baseline: mode=$md uid=$u $f"
+  done < "$INV"
+else nfx_warn "baseline file not readable: $BASE (skipping allow-list check)"; fi
+while IFS='|' read -r h md u g mt f; do
+  bn=${f##*/}
+  printf '%s' "$f" | grep -qE '^/(tmp|var/tmp|dev/shm|home|root|opt|srv|Users|private/tmp|var/www|mnt|media)/' && nfx_flag "SUID-ODD-PATH" "SUID/SGID file outside system dirs: $f"
+  case "$bn" in
+    bash|sh|dash|zsh|ksh|csh|tcsh|fish|python*|perl*|ruby*|php*|node|lua*|find|vim|vi|nano|less|more|awk|gawk|mawk|nmap|env|tee|cp|mv|chmod|chown|tar|zip|unzip|gzip|xxd|dd|nc|ncat|netcat|socat|tclsh|wget|curl|rsync|docker|make|gcc|strace|ltrace|gdb|tcpdump|systemctl|journalctl|ed|sed|xargs|time|nice|ionice|taskset|flock|ip|busybox|cat|base64|openssl|git|pip*|npm|ssh|scp)
+      nfx_flag "SUID-GTFOBIN" "SUID/SGID on a shell/interpreter/gtfobin: $f" ;;
+  esac
+  case "$md" in *[2367]) nfx_flag "SUID-WW" "world-writable SUID/SGID file: mode=$md $f";; esac
+  mte=$(nfx_stat "$f" | cut -d'|' -f1); [ $((now - mte)) -lt 2592000 ] && nfx_flag "SUID-RECENT" "SUID/SGID file modified in last 30d: $f ($mt)"
+  [ "$u" != "0" ] && case "$md" in 4*|6*) nfx_flag "SUID-NONROOT" "SUID file owned by uid $u: $f";; esac
+done < "$INV"
+
+if nfx_is_linux && nfx_have getcap; then
+  nfx_header "File capabilities (getcap -r)"
+  CAPS=$(getcap -r / 2>/dev/null)
+  printf '%s\n' "$CAPS"
+  printf '%s\n' "$CAPS" | grep -E 'cap_setuid|cap_setgid|cap_sys_admin|cap_dac_override|cap_dac_read_search|cap_sys_ptrace|cap_sys_module|cap_chown|cap_fowner|cap_net_raw|cap_net_admin|=ep|cap_sys_rawio' |
+    grep -vE '^/usr/(s)?bin/(ping|ping6|arping|clockdiff|traceroute6?|mtr-packet|dumpcap|fping|newuidmap|newgidmap|gnome-keyring-daemon)|/usr/lib/x86_64-linux-gnu/gstreamer|/usr/libexec/|/snap/' |
+    while read -r l; do nfx_flag "CAPABILITY" "powerful capability on non-standard binary: $l"; done
+fi
+
+if [ -n "$SAVE" ]; then sort -t'|' -k6 "$INV" > "$SAVE" && nfx_info "inventory saved to $SAVE"; fi
+if [ -n "$COMPARE" ]; then
+  nfx_header "Comparison with $COMPARE"
+  [ -r "$COMPARE" ] || nfx_die "cannot read $COMPARE"
+  cur=$(nfx_mktemp); old=$(nfx_mktemp)
+  awk -F'|' '{print $6"|"$1"|"$2}' "$INV" | sort > "$cur"; awk -F'|' '{print $6"|"$1"|"$2}' "$COMPARE" | sort > "$old"
+  comm -13 "$old" "$cur" | while IFS='|' read -r f h md; do
+    if grep -q "^$f|" "$old"; then nfx_flag "SUID-CHANGED" "hash/mode changed since baseline: $f (now $md $h)"; else nfx_flag "SUID-ADDED" "new since baseline: $f (mode $md)"; fi
+  done
+  comm -23 "$old" "$cur" | while IFS='|' read -r f h md; do grep -q "^$f|" "$cur" || nfx_flag "SUID-REMOVED" "removed since baseline: $f"; done
+fi
+nfx_findings_summary

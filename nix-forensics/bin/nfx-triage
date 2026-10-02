@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# nfx-triage - run every collector, copy key raw artifacts, hash everything, package as evidence
+set -u
+NFX_TOOL="nfx-triage"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-triage - one-shot live-response collection: runs every nfx tool, copies key raw artifacts,
+writes a findings summary, hashes all outputs into a manifest and packs a tar.gz.
+
+Usage: nfx-triage [-d OUTDIR] [--since SPEC] [--quick] [--full] [--tools a,b,c] [--no-tar] [--case ID]
+  -d OUTDIR      output directory (default ./nfx-triage-<host>-<utc timestamp>)
+  --since SPEC   look-back window passed to time-aware tools (default 7d)
+  --quick        skip slow collectors (timeline, hash of bin dirs, webshell, package verify)
+  --full         add slow extras: full / timeline (CSV), sha256 of /bin /sbin /usr/bin /usr/sbin,
+                 nfx-packages --verify --orphans, nfx-procs --csv
+  --tools LIST   run only these tools (comma-separated names without the nfx- prefix)
+  --no-tar       leave the directory unpacked
+  --case ID      case/ticket identifier recorded in the manifest
+
+Order of volatility is respected: volatile state (procs, network, mounts, users) first, then
+persistence, logs, filesystem. Every output file is sha256-hashed into manifest.csv, and all [!]
+findings across tools are aggregated in findings.txt. Nothing on the host is modified except
+the output directory (write it to external media or a different volume when possible).
+USAGE
+}
+OUT=""; SINCE="7d"; QUICK=0; FULL=0; TOOLS=""; TAR=1; CASE=""
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d) OUT="$2"; shift ;; --since) SINCE="$2"; shift ;; --quick) QUICK=1 ;; --full) FULL=1 ;;
+    --tools) TOOLS="$2"; shift ;; --no-tar) TAR=0 ;; --case) CASE="$2"; shift ;;
+    *) nfx_die "unknown option: $1" ;;
+  esac; shift
+done
+host=$(hostname 2>/dev/null | sed 's/[^A-Za-z0-9._-]/_/g'); host=${host:-unknown}; stamp=$(nfx_now_tag)
+[ -n "$OUT" ] || OUT="./nfx-triage-${host}-${stamp}"
+mkdir -p "$OUT/raw" || nfx_die "cannot create $OUT"
+OUT=$(cd "$OUT" && pwd)
+START=$(nfx_now_epoch)
+LOG="$OUT/triage.log"
+exec > >(tee -a "$LOG") 2>&1
+nfx_banner
+nfx_root_hint
+nfx_info "output: $OUT  window: $SINCE  case: ${CASE:-n/a}"
+
+selected() { [ -z "$TOOLS" ] && return 0; printf ',%s,' "$TOOLS" | grep -q ",$1,"; }
+run_tool() { # run_tool <name> [args...]
+  local name="$1"; shift
+  selected "$name" || return 0
+  local bin="$NFX_BIN_DIR/nfx-$name" out="$OUT/$name.txt" t0 t1 rc
+  [ -x "$bin" ] || { nfx_warn "missing tool: $bin"; return; }
+  t0=$(nfx_now_epoch); printf '[*] %-14s ' "$name"
+  "$bin" --no-color "$@" > "$out" 2>&1; rc=$?
+  t1=$(nfx_now_epoch)
+  printf 'rc=%s %4ss %8s bytes  findings=%s\n' "$rc" "$((t1 - t0))" "$(wc -c < "$out" | tr -d ' ')" "$(grep -c '^\[!\]' "$out")"
+  printf '%s,%s,%s,%s\n' "$name" "$rc" "$((t1 - t0))" "$*" >> "$OUT/run.csv"
+}
+copy_raw() { # copy_raw <path>... (preserve times where possible, never follow symlinks outside)
+  local p dest
+  for p in "$@"; do
+    [ -e "$p" ] || continue
+    dest="$OUT/raw${p}"; mkdir -p "$(dirname "$dest")"
+    if [ -d "$p" ]; then cp -pR "$p" "$(dirname "$dest")/" 2>/dev/null; else cp -p "$p" "$dest" 2>/dev/null; fi
+  done
+}
+
+echo "tool,rc,seconds,args" > "$OUT/run.csv"
+nfx_header "1. Volatile state"
+run_tool sysinfo
+run_tool procs
+[ "$FULL" = 1 ] && selected procs && "$NFX_BIN_DIR/nfx-procs" --csv --no-hidden-scan > "$OUT/procs.csv" 2>/dev/null
+run_tool network
+run_tool mounts
+run_tool users
+run_tool containers --since "$SINCE"
+if nfx_is_linux; then
+  nfx_info "capturing raw volatile snapshots"
+  ps -eo pid,ppid,uid,user,lstart,etime,%cpu,%mem,stat,tty,comm,args > "$OUT/raw/ps.txt" 2>/dev/null
+  (ss -tunapel 2>/dev/null || netstat -tunapel 2>/dev/null) > "$OUT/raw/sockets.txt"
+  (ip addr 2>/dev/null; ip route 2>/dev/null; ip neigh 2>/dev/null) > "$OUT/raw/ip.txt"
+  lsof -nP 2>/dev/null > "$OUT/raw/lsof.txt"
+  cat /proc/mounts > "$OUT/raw/proc_mounts.txt" 2>/dev/null; cat /proc/modules > "$OUT/raw/proc_modules.txt" 2>/dev/null
+  (dmesg -T 2>/dev/null || dmesg 2>/dev/null) > "$OUT/raw/dmesg.txt"
+  env > "$OUT/raw/env_collector.txt"
+else
+  ps -axo pid,ppid,uid,user,lstart,etime,%cpu,%mem,stat,tty,comm,args > "$OUT/raw/ps.txt" 2>/dev/null
+  lsof -nP 2>/dev/null > "$OUT/raw/lsof.txt"; netstat -anv > "$OUT/raw/netstat.txt" 2>/dev/null
+  (ifconfig; netstat -rn; arp -an) > "$OUT/raw/net.txt" 2>/dev/null
+  mount > "$OUT/raw/mount.txt" 2>/dev/null; kmutil showloaded > "$OUT/raw/kexts.txt" 2>/dev/null
+fi
+
+nfx_header "2. Persistence, identity, access"
+run_tool persistence --since "$SINCE"
+run_tool ssh --since "$SINCE"
+run_tool kernel
+run_tool suid --save "$OUT/suid-inventory.txt"
+run_tool auth --since "$SINCE"
+run_tool shellhist
+selected shellhist && "$NFX_BIN_DIR/nfx-shellhist" --csv > "$OUT/shellhist.csv" 2>/dev/null
+
+nfx_header "3. Logs and software"
+run_tool logs --since "$SINCE"
+if [ "$FULL" = 1 ]; then run_tool packages --since "$SINCE" --verify --orphans; else run_tool packages --since "$SINCE"; fi
+nfx_is_macos && run_tool mac-artifacts --since "$SINCE" --browsers
+
+nfx_header "4. Filesystem"
+run_tool recent --since "$SINCE"
+selected recent && "$NFX_BIN_DIR/nfx-recent" --since "$SINCE" --csv --limit 5000 > "$OUT/recent.csv" 2>/dev/null
+if [ "$QUICK" = 0 ]; then
+  run_tool webshell --since "$SINCE"
+  selected timeline && { printf '[*] %-14s ' "timeline"; t0=$(nfx_now_epoch)
+    if nfx_is_macos; then "$NFX_BIN_DIR/nfx-timeline" --since "$SINCE" /etc /private/etc /Library /Users /usr/local /opt /private/tmp /private/var/tmp /Applications > "$OUT/timeline.csv" 2>/dev/null
+    else "$NFX_BIN_DIR/nfx-timeline" --since "$SINCE" /etc /root /home /tmp /var/tmp /dev/shm /opt /usr/local /var/spool /var/www /srv /boot > "$OUT/timeline.csv" 2>/dev/null; fi
+    printf 'rc=%s %4ss %8s rows\n' "$?" "$(( $(nfx_now_epoch) - t0 ))" "$(wc -l < "$OUT/timeline.csv" | tr -d ' ')"; }
+  selected hash && { printf '[*] %-14s ' "hash-procs"; "$NFX_BIN_DIR/nfx-hash" --procs > "$OUT/hash-procs.csv" 2>/dev/null; echo "rc=$?"; }
+fi
+if [ "$FULL" = 1 ]; then
+  selected timeline && { printf '[*] %-14s ' "timeline-full"; "$NFX_BIN_DIR/nfx-timeline" --bodyfile / > "$OUT/timeline-full.body" 2>/dev/null; echo "rc=$?"; }
+  selected hash && { printf '[*] %-14s ' "hash-bins"; "$NFX_BIN_DIR/nfx-hash" /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin > "$OUT/hash-bins.csv" 2>/dev/null; echo "rc=$?"; }
+fi
+
+nfx_header "5. Raw artifact copies"
+if nfx_is_linux; then
+  copy_raw /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/sudoers /etc/sudoers.d /etc/hosts /etc/resolv.conf /etc/fstab /etc/crontab /etc/cron.d /etc/anacrontab /var/spool/cron /etc/ld.so.preload /etc/ld.so.conf.d /etc/environment /etc/profile /etc/profile.d /etc/bash.bashrc /etc/rc.local /etc/ssh/sshd_config /etc/ssh/sshd_config.d /etc/pam.d /etc/os-release /etc/hostname /etc/machine-id /etc/systemd/system /etc/modprobe.d /etc/modules-load.d /etc/udev/rules.d /etc/xdg/autostart /etc/nsswitch.conf /etc/login.defs /etc/security /etc/apt/sources.list /etc/apt/sources.list.d /etc/yum.repos.d /etc/docker/daemon.json /etc/exports /etc/samba/smb.conf /etc/iptables /etc/nftables.conf /etc/audit
+  copy_raw /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages /var/log/kern.log /var/log/cron /var/log/dpkg.log /var/log/apt /var/log/yum.log /var/log/dnf.log /var/log/audit/audit.log /var/log/sudo.log
+  nfx_have journalctl && journalctl --since "-$(nfx_since_to_minutes "$SINCE")min" -o short-iso --no-pager > "$OUT/raw/journal.txt" 2>/dev/null
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    for f in .bash_history .zsh_history .sh_history .python_history .mysql_history .ssh/authorized_keys .ssh/known_hosts .ssh/config .bashrc .bash_profile .profile .zshrc .zshenv .config/autostart .config/systemd/user; do [ -e "$h/$f" ] && copy_raw "$h/$f"; done
+  done
+else
+  copy_raw /etc/passwd /etc/group /etc/sudoers /etc/sudoers.d /etc/hosts /etc/resolv.conf /etc/crontab /usr/lib/cron/tabs /var/at/tabs /etc/profile /etc/zshrc /etc/zprofile /etc/zshenv /etc/bashrc /etc/ssh/sshd_config /etc/pam.d /etc/periodic /etc/emond.d /Library/LaunchDaemons /Library/LaunchAgents /Library/StartupItems /Library/Preferences/com.apple.loginwindow.plist /Library/Preferences/com.apple.alf.plist /Library/Preferences/SystemConfiguration /var/db/ConfigurationProfiles/Store /private/var/db/emondClients /var/log/system.log /var/log/install.log /var/log/wifi.log /var/log/asl /var/audit /var/db/dslocal/nodes/Default/users
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    for f in .bash_history .zsh_history .zsh_sessions .bash_sessions .python_history .ssh/authorized_keys .ssh/known_hosts .ssh/config .bashrc .bash_profile .profile .zshrc .zshenv .zprofile Library/LaunchAgents Library/Preferences/com.apple.LaunchServices.QuarantineEventsV2 "Library/Preferences/com.apple.loginitems.plist" "Library/Application Support/com.apple.backgroundtaskmanagementagent" "Library/Application Support/com.apple.sharedfilelist" "Library/Application Support/com.apple.TCC/TCC.db" Library/Preferences/ByHost; do [ -e "$h/$f" ] && copy_raw "$h/$f"; done
+  done
+  copy_raw "/Library/Application Support/com.apple.TCC/TCC.db"
+  log show --last "$(nfx_since_to_minutes "$SINCE")m" --style syslog --predicate 'process == "sshd" OR process == "sudo" OR process == "su" OR process == "loginwindow" OR process == "screensharingd" OR process == "launchd" OR process == "kernel" OR subsystem == "com.apple.TCC" OR process == "XProtectRemediator"' > "$OUT/raw/unified-log-security.txt" 2>/dev/null
+fi
+nfx_info "raw copies: $(find "$OUT/raw" -type f 2>/dev/null | wc -l | tr -d ' ') files"
+
+nfx_header "6. Findings summary"
+{
+  printf 'nfx-triage findings | host=%s | os=%s | case=%s | collected=%s by uid=%s | window=%s\n' "$host" "$NFX_OS" "${CASE:-n/a}" "$(nfx_now_iso)" "$(id -u)" "$SINCE"
+  printf 'Flags are leads, not verdicts. Each line is prefixed by the tool that produced it.\n\n'
+  for f in "$OUT"/*.txt; do
+    n=${f##*/}; n=${n%.txt}; [ "$n" = "findings" ] || [ "$n" = "triage" ] || [ "$n" = "suid-inventory" ] && continue
+    grep -E '^\[!\]' "$f" 2>/dev/null | sed "s/^\[!\] /[$n] /"
+  done
+} > "$OUT/findings.txt"
+nfx_section "findings by tag"
+grep -oE '^\[[a-z-]+\] \[[A-Z0-9()!=_.-]+' "$OUT/findings.txt" | awk '{print $1, $2}' | sort | uniq -c | sort -rn | head -40
+printf '\ntotal findings: %s (see %s/findings.txt)\n' "$(grep -c '^\[' "$OUT/findings.txt")" "$OUT"
+
+nfx_header "7. Manifest and packaging"
+{
+  printf '# nfx-triage manifest | version=%s | host=%s | os=%s | case=%s | start=%s | end=%s | collector_uid=%s\n' "$NFX_VERSION" "$host" "$NFX_OS" "${CASE:-n/a}" "$(nfx_epoch_to_iso "$START")" "$(nfx_now_iso)" "$(id -u)"
+  echo "sha256,size,path"
+  (cd "$OUT" && find . -type f ! -name manifest.csv | sort | while read -r f; do printf '%s,%s,%s\n' "$(nfx_sha256 "$f")" "$(nfx_stat "$f" | cut -d'|' -f5)" "${f#./}"; done)
+} > "$OUT/manifest.csv"
+nfx_info "manifest: $(($(wc -l < "$OUT/manifest.csv") - 2)) files"
+if [ "$TAR" = 1 ]; then
+  pkg="${OUT}.tar.gz"
+  (cd "$(dirname "$OUT")" && tar -czf "$pkg" "$(basename "$OUT")" 2>/dev/null) && nfx_info "packaged: $pkg  sha256=$(nfx_sha256 "$pkg")"
+fi
+nfx_info "done in $(( $(nfx_now_epoch) - START ))s -> $OUT"

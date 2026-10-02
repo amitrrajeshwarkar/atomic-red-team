@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# nfx-kernel - kernel modules, taint, hidden modules, eBPF/ftrace hooks, kexts and system extensions
+set -u
+NFX_TOOL="nfx-kernel"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-kernel - loaded kernel modules / kexts, taint state, signature status, hidden-module
+detection, modprobe hooks, eBPF programs, ftrace/kprobe hooks, hardening sysctls, SIP/Gatekeeper.
+
+Usage: nfx-kernel [-o FILE] [--no-color]
+
+Linux checks: /proc/modules vs /sys/module (module hidden from lsmod), modules outside
+/lib/modules/$(uname -r), unsigned modules (modinfo), taint flags decoded, modprobe.d
+'install' directives, modules-load.d, bpftool prog list, kprobe_events/enabled_functions,
+kernel.modules_disabled, kptr_restrict, ptrace_scope, dmesg module errors.
+macOS checks: third-party kexts (kmutil/kextstat), system extensions, SIP, Gatekeeper,
+secure boot / authenticated root, kext staging directory.
+ATT&CK: T1014 (Rootkit), T1547.006 (Kernel Modules and Extensions), T1562.001 (Impair Defenses).
+USAGE
+}
+nfx_std_args "$@"
+nfx_banner; nfx_root_hint
+
+if nfx_is_linux; then
+  kver=$(uname -r)
+  nfx_header "Kernel $kver"
+  nfx_cat_if /proc/version
+  nfx_cat_if /proc/cmdline
+  nfx_section "taint status"
+  t=$(cat /proc/sys/kernel/tainted 2>/dev/null || echo 0)
+  printf 'kernel.tainted = %s\n' "$t"
+  if [ "$t" != "0" ]; then
+    i=0; names="P:proprietary F:forced-load S:smp-unsafe R:forced-unload M:machine-check B:bad-page U:user-taint D:oops A:acpi-override W:warning C:staging I:firmware-bug O:out-of-tree E:unsigned-module L:softlockup K:live-patched X:aux T:randstruct N:test"
+    for n in $names; do bit=$(( (t >> i) & 1 )); [ "$bit" = 1 ] && printf '  bit %2d set: %s\n' "$i" "$n"; i=$((i+1)); done
+    [ $(( (t >> 12) & 1 )) = 1 ] && nfx_flag "TAINT-OOT" "out-of-tree module loaded (taint O)"
+    [ $(( (t >> 13) & 1 )) = 1 ] && nfx_flag "TAINT-UNSIGNED" "unsigned module loaded (taint E)"
+    [ $(( (t >> 1) & 1 )) = 1 ] && nfx_flag "TAINT-FORCED" "module force-loaded (taint F)"
+  fi
+
+  nfx_header "Loaded modules"
+  if nfx_have lsmod; then lsmod 2>/dev/null; else cat /proc/modules 2>/dev/null; fi
+  nfx_section "module details (path / signer)"
+  awk '{print $1}' /proc/modules 2>/dev/null | while read -r m; do
+    path=$(modinfo -n "$m" 2>/dev/null); signer=$(modinfo -F signer "$m" 2>/dev/null | head -1)
+    printf '%-24s %-40s %s\n' "$m" "${signer:-UNSIGNED/none}" "${path:-NOT-FOUND-ON-DISK}"
+    [ -z "$path" ] && nfx_flag "MODULE-NOFILE" "module '$m' is loaded but modinfo cannot find its file (loaded from memory or deleted?)"
+    [ -n "$path" ] && case "$path" in /lib/modules/"$kver"/*|/usr/lib/modules/"$kver"/*) ;; *) nfx_flag "MODULE-ODD-PATH" "module '$m' loaded from outside the kernel tree: $path";; esac
+    [ -n "$path" ] && case "$path" in */extra/*|*/updates/*|*/kernel/drivers/*/dkms*|/lib/modules/*/misc/*) nfx_info "module '$m' comes from an out-of-tree location: $path";; esac
+    [ -n "$path" ] && [ -z "$signer" ] && nfx_flag "MODULE-UNSIGNED" "module '$m' has no signature ($path)"
+  done 2>/dev/null
+
+  nfx_header "Hidden module detection"
+  a=$(nfx_mktemp); b=$(nfx_mktemp)
+  awk '{print $1}' /proc/modules 2>/dev/null | sort > "$a"
+  for d in /sys/module/*; do [ -f "$d/initstate" ] && echo "${d#/sys/module/}"; done 2>/dev/null | sort > "$b"
+  comm -13 "$a" "$b" | while read -r m; do nfx_flag "HIDDEN-MODULE" "module '$m' has a live sysfs entry but is missing from /proc/modules (rootkit hiding?)"; done
+  comm -23 "$a" "$b" | while read -r m; do nfx_info "module '$m' listed in /proc/modules but has no /sys/module initstate (builtin/odd)"; done
+  nfx_info "compared $(wc -l < "$a" | tr -d ' ') /proc/modules entries vs $(wc -l < "$b" | tr -d ' ') sysfs live modules"
+  if [ -r /proc/kallsyms ] && nfx_is_root; then
+    grep -E '\[[^]]+\]$' /proc/kallsyms 2>/dev/null | awk '{print $NF}' | tr -d '[]' | sort -u > "$b"
+    comm -13 "$a" "$b" | while read -r m; do nfx_flag "HIDDEN-MODULE-KSYMS" "symbols tagged for module '$m' exist in kallsyms but it is not in /proc/modules"; done
+  fi
+
+  nfx_header "Module loading configuration"
+  for d in /etc/modprobe.d /usr/lib/modprobe.d /run/modprobe.d /etc/modules-load.d /usr/lib/modules-load.d; do
+    [ -d "$d" ] || continue
+    nfx_section "$d"; nfx_ls_l "$d" | tail -n +2
+    grep -rnE '^[[:space:]]*install[[:space:]]' "$d" 2>/dev/null | grep -vE '/bin/(true|false)$' | while read -r l; do nfx_flag "MODPROBE-INSTALL" "install directive runs a command when module is requested: $l"; done
+  done
+  nfx_cat_if /etc/modules
+  nfx_section "sysctl hardening"
+  for k in kernel.modules_disabled kernel.kptr_restrict kernel.dmesg_restrict kernel.yama.ptrace_scope kernel.unprivileged_bpf_disabled kernel.unprivileged_userns_clone fs.protected_symlinks fs.protected_hardlinks fs.suid_dumpable kernel.randomize_va_space kernel.perf_event_paranoid; do
+    v=$(sysctl -n "$k" 2>/dev/null) && printf '%-40s = %s\n' "$k" "$v"
+  done
+  [ "$(sysctl -n kernel.randomize_va_space 2>/dev/null)" = "0" ] && nfx_flag "ASLR-OFF" "kernel.randomize_va_space=0 (ASLR disabled)"
+  [ "$(sysctl -n fs.suid_dumpable 2>/dev/null)" = "2" ] && nfx_info "fs.suid_dumpable=2 (SUID core dumps allowed)"
+  lsm=$(cat /sys/kernel/security/lsm 2>/dev/null); printf 'LSMs: %s\n' "${lsm:-?}"
+  nfx_have getenforce && printf 'SELinux: %s\n' "$(getenforce 2>/dev/null)"
+  nfx_have aa-status && nfx_is_root && printf 'AppArmor: %s\n' "$(aa-status --enabled 2>/dev/null && echo enabled || echo disabled)"
+
+  nfx_header "eBPF programs / maps"
+  if nfx_have bpftool && nfx_is_root; then
+    bpftool prog list 2>/dev/null | head -60
+    bpftool prog list 2>/dev/null | grep -E 'kprobe|tracepoint|xdp|sched_cls|socket_filter|lsm' | while read -r l; do nfx_info "eBPF program of interest: $l"; done
+    nb=$(bpftool prog list 2>/dev/null | grep -cE '^[0-9]+:')
+    [ "$nb" -gt 0 ] && nfx_info "$nb eBPF programs loaded (EDR/agents use these; unknown loaders deserve a look)"
+  else
+    nfx_info "bpftool unavailable or not root; listing /sys/fs/bpf"
+    ls -la /sys/fs/bpf 2>/dev/null
+  fi
+  nfx_header "ftrace / kprobe hooks"
+  for f in /sys/kernel/tracing/kprobe_events /sys/kernel/debug/tracing/kprobe_events /sys/kernel/tracing/uprobe_events /sys/kernel/debug/tracing/uprobe_events; do
+    [ -s "$f" ] && { nfx_section "$f"; cat "$f"; nfx_flag "KPROBE" "kprobes/uprobes defined in $f"; }
+  done
+  for f in /sys/kernel/tracing/enabled_functions /sys/kernel/debug/tracing/enabled_functions; do
+    [ -r "$f" ] || continue
+    n=$(wc -l < "$f" 2>/dev/null | tr -d ' '); printf '%s: %s hooked functions\n' "$f" "$n"
+    [ "$n" -gt 0 ] && { head -30 "$f"; nfx_flag "FTRACE-HOOK" "$n kernel functions have ftrace hooks attached (see $f)"; }
+    break
+  done
+  nfx_header "Kernel log: module / integrity messages"
+  (dmesg -T 2>/dev/null || dmesg 2>/dev/null) | grep -iE 'module|taint|verification|signature|lockdown|insmod|rootkit|hidden|kprobe|ftrace' | tail -30
+  (dmesg 2>/dev/null) | grep -iE 'module verification failed|loading out-of-tree module taints|Unknown symbol' | tail -5 | while read -r l; do nfx_flag "DMESG-MODULE" "$l"; done
+  nfx_cat_if /sys/kernel/security/lockdown
+
+else # macOS
+  nfx_header "Kernel $(uname -r)"
+  sysctl kern.version kern.osproductversion kern.bootargs 2>/dev/null
+  nfx_header "Integrity protections"
+  nfx_have csrutil && { printf 'SIP        : %s\n' "$(csrutil status 2>/dev/null | head -1)"; csrutil status 2>/dev/null | grep -qi 'disabled' && nfx_flag "SIP-DISABLED" "System Integrity Protection is disabled"; }
+  nfx_have csrutil && { ar=$(csrutil authenticated-root status 2>/dev/null); printf 'auth-root  : %s\n' "$ar"; printf '%s' "$ar" | grep -qi disabled && nfx_flag "AUTHROOT-DISABLED" "authenticated root is disabled (sealed system volume modifiable)"; }
+  nfx_have spctl && { gk=$(spctl --status 2>/dev/null); printf 'gatekeeper : %s\n' "$gk"; printf '%s' "$gk" | grep -qi disabled && nfx_flag "GATEKEEPER-OFF" "Gatekeeper assessments disabled"; }
+  printf 'secure boot: %s\n' "$(nvram 94b73556-2197-4702-82a8-3e1337dafbfb:AppleSecureBootPolicy 2>/dev/null | awk '{print $NF}')"
+  printf 'XProtect   : %s\n' "$(defaults read /Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Info.plist CFBundleShortVersionString 2>/dev/null)"
+  printf 'MRT        : %s\n' "$(defaults read /Library/Apple/System/Library/CoreServices/MRT.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null)"
+  nfx_header "Kernel extensions (non-Apple)"
+  if nfx_have kmutil; then kmutil showloaded --list-only 2>/dev/null | grep -v 'com.apple' | tee /dev/stderr 2>/dev/null | grep -E '^ *[0-9]' | while read -r l; do nfx_flag "THIRD-PARTY-KEXT" "$l"; done
+  elif nfx_have kextstat; then kextstat 2>/dev/null | grep -v 'com.apple' | tail -n +2 | while read -r l; do printf '%s\n' "$l"; nfx_flag "THIRD-PARTY-KEXT" "$l"; done; fi
+  nfx_section "kext staging / Library/Extensions"
+  nfx_ls_l /Library/Extensions
+  nfx_ls_l /Library/StagedExtensions 2>/dev/null | head -20
+  nfx_header "System extensions"
+  nfx_have systemextensionsctl && systemextensionsctl list 2>/dev/null
+  nfx_header "Kernel log (module/kext messages)"
+  log show --last 1d --predicate 'process == "kernel" AND (eventMessage CONTAINS "kext" OR eventMessage CONTAINS "extension")' --style compact 2>/dev/null | tail -30
+fi
+nfx_findings_summary

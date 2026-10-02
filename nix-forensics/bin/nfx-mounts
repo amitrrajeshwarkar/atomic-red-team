@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# nfx-mounts - mounted filesystems, bind-mount process hiding, removable media and USB history
+set -u
+NFX_TOOL="nfx-mounts"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-mounts - mounts, fstab drift, bind mounts over /proc (process hiding), loop devices,
+network/fuse filesystems, removable media, USB device history, disk images.
+
+Usage: nfx-mounts [-o FILE] [--no-color]
+
+ATT&CK: T1014 (Rootkit - bind mount over /proc/PID), T1052.001 (Exfiltration over USB),
+T1091 (Replication Through Removable Media), T1200 (Hardware Additions), T1564 (Hide Artifacts).
+USAGE
+}
+nfx_std_args "$@"
+nfx_banner; nfx_root_hint
+
+nfx_header "Mounted filesystems"
+if nfx_is_linux; then
+  if nfx_have findmnt; then findmnt -rno TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null | column -t 2>/dev/null || findmnt 2>/dev/null; else cat /proc/mounts 2>/dev/null; fi
+  M=$(cat /proc/self/mounts 2>/dev/null)
+  printf '%s\n' "$M" | awk '$2 ~ /^\/proc\/[0-9]+/ {print}' | while read -r l; do nfx_flag "PROC-BIND-MOUNT" "mount over a /proc/PID entry hides that process from ps: $l"; done
+  printf '%s\n' "$M" | awk '$2 ~ /^\/(etc|bin|sbin|usr\/bin|usr\/sbin|lib|lib64)(\/|$)/ && $3 != "overlay" {print}' | while read -r l; do nfx_flag "SYSTEM-OVERMOUNT" "something mounted over a system directory: $l"; done
+  printf '%s\n' "$M" | awk '$3 ~ /^(nfs|nfs4|cifs|smb3|sshfs|fuse\.sshfs|davfs|fuse\.rclone|9p|afs)$/ {print}' | while read -r l; do nfx_info "network/remote filesystem: $l"; done
+  printf '%s\n' "$M" | awk '$4 ~ /hidepid/ {print $2, $4}' | while read -r l; do nfx_info "/proc mounted with hidepid: $l"; done
+  printf '%s\n' "$M" | awk '$3=="tmpfs" && $2 !~ /^\/(dev|run|sys|tmp|var\/tmp|dev\/shm|proc)/ {print}' | while read -r l; do nfx_info "tmpfs on an unusual path (RAM-only storage): $l"; done
+  printf '%s\n' "$M" | awk '$1 ~ /^\/dev\/loop/ {print}' | while read -r l; do nfx_info "loop-device mount: $l"; done
+  nfx_section "mount namespaces (processes not in the init mount namespace)"
+  init_ns=$(readlink /proc/1/ns/mnt 2>/dev/null)
+  for d in /proc/[0-9]*; do ns=$(readlink "$d/ns/mnt" 2>/dev/null) || continue; [ "$ns" != "$init_ns" ] && printf '%s %s %s\n' "${d#/proc/}" "$ns" "$(cat "$d/comm" 2>/dev/null)"; done | head -40
+  nfx_header "Block devices / loop / LVM"
+  nfx_have lsblk && lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,UUID,RM,MODEL 2>/dev/null
+  nfx_have losetup && { nfx_section "losetup -a"; losetup -a 2>/dev/null; }
+  nfx_have lvs && nfx_is_root && { nfx_section "lvs"; lvs 2>/dev/null; }
+  nfx_header "fstab vs live mounts"
+  nfx_cat_if /etc/fstab
+  grep -vE '^[[:space:]]*(#|$)' /etc/fstab 2>/dev/null | awk '{print $2}' | while read -r mp; do
+    case "$mp" in none|swap|/proc|/sys) continue;; esac
+    printf '%s\n' "$M" | awk -v m="$mp" '$2==m{f=1} END{exit !f}' || nfx_info "fstab entry not currently mounted: $mp"
+  done
+  grep -vE '^[[:space:]]*(#|$)' /etc/fstab 2>/dev/null | grep -E '^[^ ]+[[:space:]]+/proc/[0-9]+|bind.*(/proc|/etc|/bin|/usr)' | while read -r l; do nfx_flag "FSTAB-BIND" "$l"; done
+  nfx_section "auto-mount units"
+  nfx_have systemctl && systemctl list-units --type=mount,automount --no-legend --no-pager 2>/dev/null | grep -vE 'sys-|dev-|run-|proc-' | head -30
+  nfx_header "USB / removable devices"
+  nfx_section "currently connected USB devices"
+  for d in /sys/bus/usb/devices/*; do
+    [ -f "$d/product" ] || continue
+    printf '%-14s %s | %s | serial=%s | %s\n' "${d##*/}" "$(cat "$d/manufacturer" 2>/dev/null)" "$(cat "$d/product" 2>/dev/null)" "$(cat "$d/serial" 2>/dev/null)" "$(cat "$d/idVendor" 2>/dev/null):$(cat "$d/idProduct" 2>/dev/null)"
+  done
+  nfx_have lsusb && lsusb 2>/dev/null
+  nfx_section "USB storage history (kernel log / journal)"
+  (journalctl -k --no-pager -q 2>/dev/null || dmesg 2>/dev/null) | grep -iE 'usb-storage|USB Mass Storage|SerialNumber:|Product:|Manufacturer:|sd[a-z]: sd[a-z][0-9]|removable disk' | tail -40
+  for f in /var/log/kern.log /var/log/messages /var/log/syslog; do
+    [ -e "$f" ] && nfx_read_logs "$f" 2>/dev/null | grep -iE 'usb-storage|USB Mass Storage|SerialNumber:' | tail -20
+  done
+  (journalctl -k --no-pager -q 2>/dev/null || dmesg 2>/dev/null) | grep -iE 'USB Mass Storage|usb-storage' | tail -5 | while read -r l; do nfx_info "USB mass storage seen: $l"; done
+  nfx_section "media mount points"
+  ls -la /media/* /mnt /run/media/* 2>/dev/null | head -30
+  nfx_header "Shared / exported"
+  nfx_cat_if /etc/exports
+  nfx_have showmount && showmount -e localhost 2>/dev/null | head
+else
+  mount 2>/dev/null
+  mount 2>/dev/null | grep -E 'nfs|smbfs|afpfs|webdav|fuse|macfuse|osxfuse' | while read -r l; do nfx_info "network/fuse filesystem: $l"; done
+  nfx_header "diskutil"
+  diskutil list 2>/dev/null
+  nfx_header "Disk images attached (hdiutil)"
+  hdiutil info 2>/dev/null | grep -E 'image-path|/dev/disk|mount-point' | head -40
+  hdiutil info 2>/dev/null | grep -E 'image-path' | while read -r l; do nfx_info "attached disk image: $l"; done
+  nfx_header "/Volumes"
+  nfx_ls_l /Volumes
+  nfx_header "USB devices (system_profiler)"
+  system_profiler SPUSBDataType 2>/dev/null | grep -E '^ {4,}[A-Za-z].*:$|Serial Number|Vendor ID|Product ID|Manufacturer|Capacity|Removable' | head -80
+  nfx_header "USB / volume history (unified log, last 7 days)"
+  log show --last 7d --predicate 'eventMessage CONTAINS "USBMSC" OR eventMessage CONTAINS "USB Mass Storage" OR (process == "diskarbitrationd" AND eventMessage CONTAINS "mounted")' --style compact 2>/dev/null | tail -40
+  nfx_section "known removable volumes (fseventsd UUIDs)"
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    [ -d "$h/Library/Preferences" ] && defaults read "$h/Library/Preferences/com.apple.finder" FXRecentFolders 2>/dev/null | grep -E 'file://' | head -10
+  done
+  nfx_header "Sharing"
+  nfx_have sharing && sharing -l 2>/dev/null
+  nfx_cat_if /etc/exports
+fi
+nfx_findings_summary

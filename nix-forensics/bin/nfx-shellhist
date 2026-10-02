@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# nfx-shellhist - collect and triage shell/interpreter history for every user
+set -u
+NFX_TOOL="nfx-shellhist"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-shellhist - collect shell & interpreter history for all users, normalise timestamps,
+flag suspicious commands and anti-forensics.
+
+Usage: nfx-shellhist [--user NAME] [--grep REGEX] [--tail N] [--all] [--csv] [-o FILE] [--no-color]
+  --user NAME    only this user
+  --grep REGEX   additional pattern to search for (case-insensitive)
+  --tail N       lines of each history file to print (default 40, 0 = none)
+  --all          print every history file in full
+  --csv          emit CSV: user,file,line_no,timestamp_utc,command  (no analysis text)
+
+Files: .bash_history .zsh_history .zhistory .sh_history .ash_history .history .local/share/fish/fish_history
+.python_history .mysql_history .psql_history .sqlite_history .rediscli_history .node_repl_history
+.irb_history .lesshst .viminfo .wget-hsts .nano_history .php_history .scala_history .mongo_history
+ATT&CK: T1059.004 (Unix Shell), T1070.003 (Clear Command History), T1552.001/T1552.003
+(Credentials in Files / Bash History), T1105 (Ingress Tool Transfer).
+USAGE
+}
+USER_F=""; GREP=""; TAIL=40; ALL=0; CSV=0
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user) USER_F="$2"; shift ;; --grep) GREP="$2"; shift ;; --tail) TAIL="$2"; shift ;;
+    --all) ALL=1 ;; --csv) CSV=1 ;;
+    *) nfx_die "unknown option: $1" ;;
+  esac; shift
+done
+[ "$CSV" = 1 ] || { nfx_banner; nfx_root_hint; }
+[ "$CSV" = 1 ] && echo "user,file,line,timestamp_utc,command"
+
+HIST_FILES=".bash_history .zsh_history .zhistory .sh_history .ash_history .history .local/share/fish/fish_history .python_history .mysql_history .psql_history .sqlite_history .rediscli_history .node_repl_history .irb_history .lesshst .viminfo .wget-hsts .nano_history .php_history .scala_history .mongo_history .dbshell .sqlplus_history .config/nushell/history.txt .local/share/nvim/shada/main.shada"
+CRED_RE='(passw(or)?d|passwd|pwd|secret|token|api[_-]?key|Authorization: *Bearer|AKIA[0-9A-Z]{16}|mysql .*-p[^ ]|sshpass|PGPASSWORD|--password[= ]|-p[[:space:]]*[^ -]{4,})'
+
+# normalise <file> -> lines "lineno<TAB>epoch<TAB>cmd" (epoch empty when unknown)
+normalise() {
+  local f="$1"
+  case "$f" in
+    *zsh_history|*zhistory)
+      # extended: ": 1700000000:0;cmd"
+      awk '{ if (match($0,/^: [0-9]+:[0-9]+;/)) { ts=substr($0,3,10); cmd=substr($0,RLENGTH+1) } else { ts=""; cmd=$0 } printf "%d\t%s\t%s\n", NR, ts, cmd }' "$f" ;;
+    *fish_history)
+      awk '/^- cmd: /{cmd=substr($0,8); ts=""} /^  when: /{ts=$2; printf "%d\t%s\t%s\n", NR, ts, cmd}' "$f" ;;
+    *)
+      # bash with HISTTIMEFORMAT: "#1700000000" precedes each cmd
+      awk '{ if ($0 ~ /^#[0-9]{9,10}$/) { ts=substr($0,2); next } printf "%d\t%s\t%s\n", NR, ts, $0; ts="" }' "$f" ;;
+  esac
+}
+
+nfx_user_homes | while IFS=: read -r u uid h sh; do
+  [ -n "$USER_F" ] && [ "$u" != "$USER_F" ] && continue
+  found=0
+  for hf in $HIST_FILES; do
+    f="$h/$hf"; [ -e "$f" ] || [ -L "$f" ] || continue
+    found=1
+    if [ "$CSV" = 1 ]; then
+      normalise "$f" 2>/dev/null | awk -F'\t' -v u="$u" -v f="$f" "$NFX_AWK_ISO"'{ c=$3; gsub(/"/,"\"\"",c); printf "%s,%s,%s,%s,\"%s\"\n", u, f, $1, iso($2), c }'
+      continue
+    fi
+    nfx_section "user=$u  $f"
+    if [ -L "$f" ]; then
+      tgt=$(readlink "$f"); printf 'symlink -> %s\n' "$tgt"
+      case "$tgt" in /dev/null) nfx_flag "HIST-NULL" "user $u: $f is symlinked to /dev/null (anti-forensics T1070.003)";; esac
+      [ -e "$f" ] || continue
+    fi
+    nfx_stat_line "$f"
+    sz=$(nfx_stat "$f" | cut -d'|' -f5); n=$(wc -l < "$f" | tr -d ' ')
+    printf 'lines=%s\n' "$n"
+    [ "$sz" = "0" ] && case "$hf" in .bash_history|.zsh_history|.sh_history|.zhistory) nfx_flag "HIST-EMPTY" "user $u: $f is empty (cleared, or history disabled)";; esac
+    ts_count=$(normalise "$f" | awk -F'\t' '$2!=""' | wc -l | tr -d ' ')
+    [ "$ts_count" -gt 0 ] && printf 'timestamped entries=%s (first=%s last=%s)\n' "$ts_count" \
+      "$(normalise "$f" | awk -F'\t' '$2!=""{print $2; exit}' | awk "$NFX_AWK_ISO"'{print iso($1)}')" \
+      "$(normalise "$f" | awk -F'\t' '$2!=""{l=$2} END{print l}' | awk "$NFX_AWK_ISO"'{print iso($1)}')"
+    if [ "$ALL" = 1 ]; then normalise "$f" | awk -F'\t' "$NFX_AWK_ISO"'{printf "%5d %-20s %s\n",$1,iso($2),$3}'
+    elif [ "$TAIL" -gt 0 ] 2>/dev/null; then printf '... last %s lines:\n' "$TAIL"; normalise "$f" | tail -"$TAIL" | awk -F'\t' "$NFX_AWK_ISO"'{printf "%5d %-20s %s\n",$1,iso($2),$3}'; fi
+    normalise "$f" | awk -F'\t' '{print $1"\t"$3}' | grep -E "$NFX_SUSP_RE" | head -40 | while IFS=$'\t' read -r ln cmd; do nfx_flag "SUSP-CMD" "user $u ${f##*/}:$ln: $cmd"; done
+    normalise "$f" | awk -F'\t' '{print $1"\t"$3}' | grep -iE "$CRED_RE" | head -20 | while IFS=$'\t' read -r ln cmd; do nfx_flag "CRED-IN-HIST" "user $u ${f##*/}:$ln: $cmd"; done
+    normalise "$f" | awk -F'\t' '{print $1"\t"$3}' | grep -E '^[0-9]+\t(sudo |)(wget|curl|scp|sftp|rsync|git clone|pip3? install|npm i|gem install)[[:space:]]' | head -20 | while IFS=$'\t' read -r ln cmd; do nfx_flag "TOOL-TRANSFER" "user $u ${f##*/}:$ln: $cmd"; done
+    [ -n "$GREP" ] && normalise "$f" | awk -F'\t' '{print $1"\t"$3}' | grep -iE "$GREP" | while IFS=$'\t' read -r ln cmd; do nfx_flag "USER-GREP" "user $u ${f##*/}:$ln: $cmd"; done
+  done
+  [ "$CSV" = 1 ] || [ "$found" = 1 ] || printf '\n[*] user=%s: no history files in %s\n' "$u" "$h"
+done
+
+if [ "$CSV" = 0 ]; then
+  nfx_header "History configuration / anti-forensics in rc files"
+  for f in /etc/profile /etc/bash.bashrc /etc/bashrc /etc/zshrc /etc/zshenv /etc/profile.d/*; do
+    [ -f "$f" ] && grep -nE 'HISTSIZE=0|HISTFILESIZE=0|unset[[:space:]]+HISTFILE|HISTFILE=/dev/null|set \+o history' "$f" 2>/dev/null | while read -r l; do nfx_flag "HIST-CONFIG" "$f:$l"; done
+  done
+  nfx_user_homes | while IFS=: read -r u uid h sh; do
+    for rc in .bashrc .bash_profile .profile .zshrc .zshenv .zprofile; do
+      [ -f "$h/$rc" ] && grep -nE 'HISTSIZE=0|HISTFILESIZE=0|unset[[:space:]]+HISTFILE|HISTFILE=/dev/null|set \+o history' "$h/$rc" 2>/dev/null | while read -r l; do nfx_flag "HIST-CONFIG" "user $u $rc:$l"; done
+    done
+  done
+  nfx_section "live shells with history disabled (HISTFILE/HISTSIZE in environ, Linux root only)"
+  if nfx_is_linux && nfx_is_root; then
+    for d in /proc/[0-9]*; do
+      c=$(cat "$d/comm" 2>/dev/null); case "$c" in bash|zsh|sh|dash|ksh|fish) ;; *) continue;; esac
+      ( tr '\0' '\n' < "$d/environ" ) 2>/dev/null | grep -E '^(HISTFILE=/dev/null|HISTSIZE=0|HISTFILESIZE=0)' | while read -r e; do nfx_flag "HIST-LIVE" "pid ${d#/proc/} ($c) env $e"; done
+    done
+  fi
+  nfx_findings_summary
+fi

@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# nfx-procs - running process inventory with masquerading, injection and hidden-process checks
+set -u
+NFX_TOOL="nfx-procs"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-procs - process inventory: tree, owners, binaries, cwd, env anomalies, hidden/deleted/masquerading.
+
+Usage: nfx-procs [--csv] [--no-hidden-scan] [--sign] [-o FILE] [--no-color]
+  --csv             emit one CSV row per process (pid,ppid,uid,user,start,exe,cwd,cmdline,flags)
+  --no-hidden-scan  skip the PID brute-force check for processes hidden from /proc (Linux)
+  --sign            macOS: run codesign on every unique non-system binary (slower)
+
+Checks: binary deleted after exec (T1055/T1036), running from /tmp,/dev/shm,/var/tmp,home (T1036),
+kernel-thread name with a real binary (T1036.004), comm != exe basename, memfd:/anonymous exe,
+LD_PRELOAD / DYLD_INSERT_LIBRARIES in environment (T1574.006), TracerPid != 0 (T1055.008),
+PIDs alive but absent from /proc listing (T1014 rootkit), known miner names (T1496),
+reverse-shell/interpreter one-liners on the command line (T1059).
+USAGE
+}
+CSV=0; HIDDEN=1; SIGN=0
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --csv) CSV=1 ;;
+    --no-hidden-scan) HIDDEN=0 ;;
+    --sign) SIGN=1 ;;
+    *) nfx_die "unknown option: $1 (see --help)" ;;
+  esac; shift
+done
+[ "$CSV" = 1 ] || { nfx_banner; nfx_root_hint; }
+
+TMP_RE='^/(tmp|dev/shm|var/tmp|private/tmp|private/var/tmp|run/user|home|root|Users|mnt|media|Volumes)/'
+MINER_RE='xmrig|minerd|kdevtmpfsi|kinsing|cryptonight|xmr-stak|cpuminer|ccminer|nanominer|lolminer|t-rex|phoenixminer|ethminer'
+
+# ------------------------------------------------------------------ Linux
+if nfx_is_linux; then
+  [ "$CSV" = 1 ] && echo "pid,ppid,uid,user,start_utc,exe,cwd,cmdline,flags"
+  [ "$CSV" = 1 ] || { nfx_header "Process tree"; if nfx_have pstree; then pstree -pau 2>/dev/null | head -400; else ps -eo pid,ppid,user,etime,comm --forest 2>/dev/null | head -400; fi; }
+  [ "$CSV" = 1 ] || { nfx_header "Top CPU consumers"; ps -eo pid,user,%cpu,%mem,etime,comm,args --sort=-%cpu 2>/dev/null | head -12; }
+  [ "$CSV" = 1 ] || nfx_header "Per-process detail (anomalies only unless --csv)"
+  btime=$(awk '/btime/{print $2}' /proc/stat 2>/dev/null); hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [ -r "$d/status" ] || continue
+    ppid=$(awk '/^PPid:/{print $2}' "$d/status" 2>/dev/null)
+    uid=$(awk '/^Uid:/{print $2}' "$d/status" 2>/dev/null)
+    comm=$(cat "$d/comm" 2>/dev/null)
+    tracer=$(awk '/^TracerPid:/{print $2}' "$d/status" 2>/dev/null)
+    user=$( (nfx_have getent && getent passwd "$uid" | cut -d: -f1) 2>/dev/null); user=${user:-$uid}
+    exe=$(readlink "$d/exe" 2>/dev/null); cwd=$(readlink "$d/cwd" 2>/dev/null)
+    cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null | sed 's/ $//')
+    starttick=$(awk '{print $22}' "$d/stat" 2>/dev/null)
+    start=""; [ -n "$starttick" ] && [ -n "$btime" ] && start=$(nfx_epoch_to_iso $(( btime + starttick / hz )))
+    flags=""
+    if [ -z "$cmd" ] && [ "$ppid" != "2" ] && [ "$pid" != "2" ] && [ -n "$exe" ]; then flags="$flags EMPTY-CMDLINE"; fi
+    kthread=0; { [ "$ppid" = "2" ] || [ "$pid" = "2" ]; } && [ -z "$exe" ] && kthread=1
+    if [ "$kthread" = 0 ]; then
+      case "$exe" in
+        *"(deleted)"*) flags="$flags DELETED-EXE" ;;
+        /memfd:*|"") [ -n "$cmd" ] && flags="$flags ANON-EXE" ;;
+      esac
+      printf '%s' "$exe" | grep -qE "$TMP_RE" && flags="$flags TEMP-EXE"
+      printf '%s' "$cwd" | grep -qE '^/(tmp|dev/shm|var/tmp)(/|$)' && flags="$flags TEMP-CWD"
+      case "$comm" in
+        kworker*|ksoftirq*|kthread*|migration*|rcu_*|kswapd*|watchdog*|cpuhp*|khugepaged|kcompactd*|jbd2*|ext4*|scsi_*|kblockd|md*|irq/*|\[*\])
+          [ -n "$exe" ] && flags="$flags KTHREAD-NAME-WITH-EXE" ;;
+      esac
+      if [ -n "$exe" ]; then
+        base=${exe##*/}; base=${base% (deleted)}
+        case "$base" in
+          "$comm"*|python*|perl*|ruby*|node*|java*|bash|sh|dash|zsh|busybox|ld-*|ld.so*) ;;
+          *) [ "${#comm}" -ge 15 ] || flags="$flags COMM-MISMATCH($comm!=$base)" ;;
+        esac
+      fi
+      [ -n "$tracer" ] && [ "$tracer" != "0" ] && flags="$flags TRACED-BY-$tracer"
+      if ( tr '\0' '\n' < "$d/environ" ) 2>/dev/null | grep -qE '^(LD_PRELOAD|LD_LIBRARY_PATH|LD_AUDIT)='; then flags="$flags LD-ENV"; fi
+      printf '%s' "$cmd $comm" | grep -qiE "$MINER_RE" && flags="$flags MINER-NAME"
+      printf '%s' "$cmd" | grep -qE "$NFX_SUSP_RE" && flags="$flags SUSP-CMDLINE"
+      printf '%s' "$cmd" | grep -qE '(^|/)(nc|ncat|netcat|socat|telnet)( |$)' && flags="$flags NETCAT"
+      [ "$uid" = "0" ] && printf '%s' "$exe" | grep -qE '^/(home|Users|tmp|dev/shm|var/tmp)/' && flags="$flags ROOT-FROM-USERDIR"
+      # sockets held by process
+      nsock=$(ls -l "$d/fd" 2>/dev/null | grep -c 'socket:')
+      [ -z "$exe" ] && [ -n "$cmd" ] && [ -d "$d/fd" ] && [ "$nsock" -gt 0 ] && flags="$flags NOEXE-WITH-SOCKETS"
+    fi
+    flags=${flags# }
+    if [ "$CSV" = 1 ]; then
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$pid" "$ppid" "$uid" "$(nfx_csv "$user")" "$start" "$(nfx_csv "$exe")" "$(nfx_csv "$cwd")" "$(nfx_csv "$cmd")" "$(nfx_csv "$flags")"
+    elif [ -n "$flags" ]; then
+      printf 'pid=%s ppid=%s user=%s start=%s\n  exe=%s\n  cwd=%s\n  cmd=%s\n' "$pid" "$ppid" "$user" "$start" "${exe:-?}" "${cwd:-?}" "$cmd"
+      for fl in $flags; do nfx_flag "${fl%%(*}" "pid $pid ($comm): $fl"; done
+    fi
+  done
+
+  if [ "$CSV" = 0 ] && [ "$HIDDEN" = 1 ]; then
+    nfx_header "Hidden process scan (kill -0 vs /proc listing)"
+    pidmax=$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 32768); [ "$pidmax" -gt 131072 ] && pidmax=131072
+    nfx_info "probing PIDs 1..$pidmax"
+    hidden=0; p=1
+    while [ "$p" -le "$pidmax" ]; do
+      if kill -0 "$p" 2>/dev/null && [ ! -d "/proc/$p" ]; then
+        hidden=$((hidden+1)); nfx_flag "HIDDEN-PID" "PID $p responds to signals but is not listed in /proc (rootkit?)"
+      fi
+      p=$((p+1))
+    done
+    nfx_info "hidden PIDs found: $hidden"
+    # /proc vs ps cross-check (a userland rootkit hooking readdir shows here)
+    a=$(nfx_mktemp); b=$(nfx_mktemp)
+    ls /proc 2>/dev/null | grep -E '^[0-9]+$' | sort -n > "$a"; ps -eo pid= 2>/dev/null | tr -d ' ' | sort -n > "$b"
+    comm -23 "$a" "$b" | while read -r p; do [ -d "/proc/$p" ] && nfx_flag "PS-MISMATCH" "PID $p in /proc but not in ps output"; done
+  fi
+
+  [ "$CSV" = 1 ] || { nfx_header "Processes with deleted binaries (ls /proc/*/exe)"; ls -l /proc/[0-9]*/exe 2>/dev/null | grep '(deleted)' | head -20; }
+
+# ------------------------------------------------------------------ macOS
+else
+  [ "$CSV" = 1 ] && echo "pid,ppid,uid,user,start,exe,cwd,cmdline,flags"
+  [ "$CSV" = 1 ] || { nfx_header "Process list"; ps -axo pid,ppid,user,lstart,%cpu,%mem,comm 2>/dev/null | head -400; }
+  [ "$CSV" = 1 ] || { nfx_header "Top CPU consumers"; ps -axo pid,user,%cpu,%mem,etime,comm -r 2>/dev/null | head -12; }
+  [ "$CSV" = 1 ] || nfx_header "Per-process anomalies"
+  seen=$(nfx_mktemp)
+  ps -axo pid=,ppid=,uid=,user=,comm= 2>/dev/null | while read -r pid ppid uid user exe; do
+    cmd=$(ps -o args= -p "$pid" 2>/dev/null)
+    start=$(ps -o lstart= -p "$pid" 2>/dev/null)
+    cwd=""; nfx_is_root && cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}')
+    flags=""
+    printf '%s' "$exe" | grep -qE "$TMP_RE" && flags="$flags TEMP-EXE"
+    printf '%s' "$exe" | grep -qE '^/Users/[^/]+/(Downloads|Library/Caches|\.[^/]+)/|^/Users/Shared/|^/private/tmp' && flags="$flags USER-WRITABLE-EXE"
+    printf '%s' "$cwd" | grep -qE '^/(private/)?(tmp|var/tmp)(/|$)' && flags="$flags TEMP-CWD"
+    printf '%s' "$cmd" | grep -qiE "$MINER_RE" && flags="$flags MINER-NAME"
+    printf '%s' "$cmd" | grep -qE "$NFX_SUSP_RE" && flags="$flags SUSP-CMDLINE"
+    printf '%s' "$cmd" | grep -qE '(^|/)(nc|ncat|netcat|socat|telnet)( |$)' && flags="$flags NETCAT"
+    [ -e "$exe" ] || { [ -n "$exe" ] && flags="$flags EXE-MISSING"; }
+    [ "$uid" = "0" ] && printf '%s' "$exe" | grep -qE '^/Users/|^/private/tmp|^/tmp' && flags="$flags ROOT-FROM-USERDIR"
+    case "$exe" in /System/*|/usr/*|/bin/*|/sbin/*|/Library/Apple/*) ;;
+      *) if [ "$SIGN" = 1 ] && [ -e "$exe" ] && ! grep -qxF "$exe" "$seen"; then
+           printf '%s\n' "$exe" >> "$seen"
+           cs=$(codesign -dv --verbose=2 "$exe" 2>&1)
+           printf '%s' "$cs" | grep -q 'code object is not signed' && flags="$flags UNSIGNED"
+           printf '%s' "$cs" | grep -q 'Signature=adhoc' && flags="$flags ADHOC-SIGNED"
+         fi ;;
+    esac
+    flags=${flags# }
+    if [ "$CSV" = 1 ]; then
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$pid" "$ppid" "$uid" "$(nfx_csv "$user")" "$(nfx_csv "$start")" "$(nfx_csv "$exe")" "$(nfx_csv "$cwd")" "$(nfx_csv "$cmd")" "$(nfx_csv "$flags")"
+    elif [ -n "$flags" ]; then
+      printf 'pid=%s ppid=%s user=%s start=%s\n  exe=%s\n  cwd=%s\n  cmd=%s\n' "$pid" "$ppid" "$user" "$start" "$exe" "${cwd:-?}" "$cmd"
+      for fl in $flags; do nfx_flag "$fl" "pid $pid (${exe##*/}): $fl"; done
+    fi
+  done
+  if [ "$CSV" = 0 ]; then
+    nfx_header "DYLD_INSERT_LIBRARIES in process environments"
+    ps -axEo pid,command 2>/dev/null | grep -E 'DYLD_INSERT_LIBRARIES=' | grep -v grep | while read -r l; do nfx_flag "DYLD-ENV" "$l"; done
+    nfx_header "Processes with open network sockets (lsof)"
+    lsof -i -nP 2>/dev/null | awk 'NR>1{print $1, $2, $3, $9, $10}' | sort -u | head -100
+  fi
+fi
+
+[ "$CSV" = 1 ] || nfx_findings_summary

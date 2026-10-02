@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# nfx-timeline - filesystem timeline (MAC(B) times) as CSV, mactime style
+set -u
+NFX_TOOL="nfx-timeline"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-timeline - build a filesystem timeline (mtime/atime/ctime/birth) as CSV for one or more paths.
+
+Usage: nfx-timeline [--since SPEC] [--sort m|a|c|b] [--limit N] [--all-types] [--bodyfile] PATH...
+  --since SPEC   only include files whose selected timestamp is within window (default: all)
+  --sort X       sort by m(time, default) a(time) c(time) b(irth)
+  --limit N      max rows (default 0 = unlimited)
+  --all-types    include directories, symlinks, devices (default: regular files only)
+  --bodyfile     emit Sleuthkit body format (MD5|name|inode|mode|uid|gid|size|atime|mtime|ctime|crtime)
+                 for use with mactime / Plaso; MD5 column is 0.
+
+Output CSV columns: mtime,atime,ctime,btime,size,uid,gid,mode,inode,nlink,path  (ISO-8601 UTC, newest first)
+Notes: birth time is available on macOS (APFS/HFS+) and Linux with statx-capable stat + ext4/xfs/btrfs;
+otherwise it is empty. Reading files does not update atime here (stat only), but earlier tools might have.
+ATT&CK: T1070.006 (Timestomp), supports any intrusion timeline reconstruction.
+USAGE
+}
+SINCE=""; SORT="m"; LIMIT=0; ALLT=0; BODY=0
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+PATHS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) SINCE="$2"; shift ;; --sort) SORT="$2"; shift ;; --limit) LIMIT="$2"; shift ;;
+    --all-types) ALLT=1 ;; --bodyfile) BODY=1 ;;
+    -*) nfx_die "unknown option: $1" ;;
+    *) PATHS+=("$1") ;;
+  esac; shift
+done
+[ ${#PATHS[@]} -gt 0 ] || nfx_die "at least one PATH is required (see --help)"
+EXIST=(); for p in "${PATHS[@]}"; do if [ -e "$p" ]; then EXIST+=("$p"); else nfx_warn "skipping missing path: $p"; fi; done
+[ ${#EXIST[@]} -gt 0 ] || nfx_die "none of the given paths exist"
+PATHS=("${EXIST[@]}")
+case "$SORT" in m) col=1 ;; a) col=2 ;; c) col=3 ;; b) col=4 ;; *) nfx_die "--sort must be m, a, c or b" ;; esac
+cut_epoch=0
+if [ -n "$SINCE" ]; then cut_epoch=$(( $(nfx_now_epoch) - $(nfx_since_to_minutes "$SINCE") * 60 )); fi
+TYPEARG="-type f"; [ "$ALLT" = 1 ] && TYPEARG=""
+
+RAW=$(nfx_mktemp)
+# shellcheck disable=SC2086
+if nfx_is_macos; then
+  find "${PATHS[@]}" $TYPEARG -print0 2>/dev/null | xargs -0 stat -f '%m|%a|%c|%B|%z|%u|%g|%Lp|%i|%l|%N' 2>/dev/null > "$RAW"
+else
+  find "${PATHS[@]}" $TYPEARG -print0 2>/dev/null | xargs -0 stat -c '%Y|%X|%Z|%W|%s|%u|%g|%a|%i|%h|%n' 2>/dev/null > "$RAW"
+fi
+
+if [ "$BODY" = 1 ]; then
+  awk -F'|' -v cut="$cut_epoch" -v col="$col" -v lim="$LIMIT" '{ if (cut>0 && $col+0 < cut) next; n++; if (lim>0 && n>lim) exit; b=$4; if (b=="-"||b=="") b=0; printf "0|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n", $11, $9, $8, $6, $7, $5, $2, $1, $3, b }' "$RAW"
+  exit 0
+fi
+
+echo "mtime,atime,ctime,btime,size,uid,gid,mode,inode,nlink,path"
+sort -t'|' -k"$col","$col"nr "$RAW" |
+  awk -F'|' -v cut="$cut_epoch" -v col="$col" -v lim="$LIMIT" "$NFX_AWK_ISO"'
+    { if (cut>0 && $col+0 < cut) next;
+      n++; if (lim>0 && n>lim) exit;
+      p=$11; gsub(/"/,"\"\"",p); if (p ~ /[,"]/) p="\"" p "\"";
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n", iso($1), iso($2), iso($3), iso($4), $5, $6, $7, $8, $9, $10, p }'

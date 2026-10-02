@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# nfx-webshell - scan web roots for webshells, obfuscation and recently dropped server-side scripts
+set -u
+NFX_TOOL="nfx-webshell"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-webshell - hunt web roots for webshells: dangerous function calls, obfuscation, request-driven
+execution, double extensions, hidden files, recently modified scripts, .htaccess handler tricks.
+
+Usage: nfx-webshell [--since SPEC] [--min-score N] [--path DIR]... [--csv] [-o FILE]
+  --since SPEC     highlight scripts modified within window (default 30d)
+  --min-score N    only report files scoring >= N (default 2; 1 = show everything with any hit)
+  --path DIR       web root(s) to scan (default: common Apache/Nginx/PHP/Tomcat roots that exist)
+  --csv            CSV: score,mtime,size,uid,path,hits
+
+Scoring: +1 per distinct indicator family found (eval/system/exec, base64+gzinflate, $_GET/$_POST
+into a call, chr()/hex concatenation, known shell names, long single-line body, upload handler, JSP
+Runtime.exec/ProcessBuilder, python os.system/subprocess in webroot, perl/cgi backticks).
+ATT&CK: T1505.003 (Server Software Component: Web Shell), T1105, T1027 (Obfuscated Files).
+USAGE
+}
+SINCE="30d"; MIN=2; CSV=0; PATHS=()
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do case "$1" in --since) SINCE="$2"; shift ;; --min-score) MIN="$2"; shift ;; --path) PATHS+=("$2"); shift ;; --csv) CSV=1 ;; *) nfx_die "unknown option: $1";; esac; shift; done
+mins=$(nfx_since_to_minutes "$SINCE")
+if [ ${#PATHS[@]} -eq 0 ]; then
+  for d in /var/www /srv/www /srv/http /usr/share/nginx/html /usr/local/nginx/html /var/lib/tomcat*/webapps /opt/tomcat*/webapps /usr/share/tomcat*/webapps /opt/lampp/htdocs /usr/local/apache2/htdocs /var/lib/jenkins /opt/bitnami /home/*/public_html /Library/WebServer/Documents /usr/local/var/www /opt/homebrew/var/www /var/www/html /usr/share/wordpress /var/lib/nextcloud /var/www/nextcloud /opt/gitlab/embedded/service /usr/local/lsws /var/lib/php/sessions /tmp; do
+    [ -d "$d" ] && PATHS+=("$d")
+  done
+fi
+[ ${#PATHS[@]} -gt 0 ] || nfx_die "no web roots found; pass --path DIR"
+[ "$CSV" = 1 ] || { nfx_banner; nfx_root_hint; nfx_info "scanning: ${PATHS[*]}"; }
+[ "$CSV" = 1 ] && echo "score,mtime,size,uid,path,hits"
+
+EXT_RE='\.(php|php[3-8]|phtml|phar|inc|jsp|jspx|jsw|jsv|jspf|asp|aspx|ashx|asmx|cgi|pl|py|rb|sh|war|jar|cfm|ejs|js)$'
+# indicator families: name|regex
+FAM='PHP-EXEC|(^|[^a-zA-Z_])(eval|assert|system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec|dl)[[:space:]]*\(
+PHP-OBF|base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|strrev[[:space:]]*\(|convert_uu|hex2bin|\\x[0-9a-fA-F]{2}\\x[0-9a-fA-F]{2}\\x[0-9a-fA-F]{2}|chr\([0-9]+\)[[:space:]]*\.[[:space:]]*chr\(
+PHP-REQ-EXEC|\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES)\[[^]]*\][[:space:]]*\(|(system|exec|shell_exec|passthru|eval|assert|popen|proc_open)[[:space:]]*\([[:space:]]*(base64_decode[[:space:]]*\([[:space:]]*)?\$_(GET|POST|REQUEST|COOKIE|SERVER)|\$\{?\$_(GET|POST|REQUEST|COOKIE)|call_user_func(_array)?[[:space:]]*\([[:space:]]*\$_|preg_replace[[:space:]]*\([^,]*/[a-z]*e[a-z]*["'"'"']|create_function[[:space:]]*\(|array_map[[:space:]]*\([[:space:]]*["'"'"']?(system|exec|assert)
+PHP-DYN|\$[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\([[:space:]]*\$[a-zA-Z_][a-zA-Z0-9_]*\[|\$\$[a-zA-Z_]|@?\$[a-zA-Z_]+\([[:space:]]*(base64_decode|gzinflate|str_rot13)
+PHP-UPLOAD|move_uploaded_file|copy[[:space:]]*\([[:space:]]*\$_FILES|fwrite[[:space:]]*\([^,]*,[[:space:]]*\$_(POST|GET|REQUEST)|file_put_contents[[:space:]]*\([^,]*,[[:space:]]*\$_(POST|GET|REQUEST)
+KNOWN-SHELL|c99|c100|r57|wso[[:space:]]*(shell|_|[0-9])|b374k|weevely|FilesMan|FilesTools|Mini Shell|AnonymousFox|indoxploit|alfa[[:space:]]*shell|WebShell|webshell|Uname:|Safe[-_ ]?mode|php_uname|shell_exec\("uname|whoami\b.*\bexec|<title>[^<]*(shell|hack|pwn|0wn)|antichat|priv8|bypass[[:space:]]*(shell|403)|godzilla|behinder|chopper|cknife|antsword|regeorg|neo-reGeorg|tunnel\.php|p0wny|\bmsfvenom\b|Meterpreter|reverse[_ ]?shell|/bin/sh[[:space:]]+-i|/dev/tcp/
+JSP-EXEC|Runtime\.getRuntime\(\)\.exec|ProcessBuilder|new[[:space:]]+ProcessBuilder|java\.lang\.Runtime|Class\.forName\([^)]*\)\.getMethod|defineClass|javax\.script\.ScriptEngine|BeanShell|getParameter\([^)]*\)[^;]*exec
+ASP-EXEC|WScript\.Shell|Shell\.Application|cmd\.exe|Server\.CreateObject|eval[[:space:]]*\(Request|execute[[:space:]]*\(Request|Process\.Start|System\.Diagnostics\.Process
+SCRIPT-EXEC|os\.system|subprocess\.(Popen|call|run|check_output)|commands\.getoutput|`[^`]*(cmd|\$q|\$c|param)[^`]*`|open[[:space:]]*\([^)]*\|[[:space:]]*["'"'"']|IO\.popen|Kernel\.exec|child_process|\.exec\([[:space:]]*(req|request)
+OBF-LONGLINE|__LONGLINE__'
+
+score_file() { # score_file <file> -> "score|hits"
+  local f="$1" score=0 hits="" name re
+  printf '%s\n' "$FAM" | while IFS='|' read -r name re; do
+    if [ "$name" = "OBF-LONGLINE" ]; then
+      awk 'length($0)>2000 && /(eval|base64|gzinflate|chr\(|\\x[0-9a-f]{2}|fromCharCode|String\.fromCharCode)/{f=1} END{exit !f}' "$f" 2>/dev/null && printf '%s\n' "$name"
+    else
+      grep -qE "$re" "$f" 2>/dev/null && printf '%s\n' "$name"
+    fi
+  done | tr '\n' ' '
+}
+
+TMPL=$(nfx_mktemp)
+find "${PATHS[@]}" -xdev -type f -size -4M 2>/dev/null | grep -E "$EXT_RE" | grep -vE '/(node_modules|vendor/composer|\.git)/' > "$TMPL"
+[ "$CSV" = 1 ] || nfx_info "$(wc -l < "$TMPL" | tr -d ' ') candidate scripts"
+
+[ "$CSV" = 1 ] || nfx_header "Scored files (score >= $MIN)"
+while IFS= read -r f; do
+  hits=$(score_file "$f"); hits=${hits% }
+  [ -z "$hits" ] && continue
+  score=$(printf '%s\n' "$hits" | wc -w | tr -d ' ')
+  # bonus: file in an uploads/images/cache/tmp dir, hidden, double extension, world-writable, recently modified
+  case "$f" in */uploads/*|*/upload/*|*/images/*|*/img/*|*/cache/*|*/tmp/*|*/temp/*|*/media/*|*/files/*|*/assets/*) score=$((score+1)); hits="$hits UPLOAD-DIR";; esac
+  case "${f##*/}" in .*) score=$((score+1)); hits="$hits HIDDEN";; esac
+  printf '%s' "${f##*/}" | grep -qE '\.(jpg|jpeg|png|gif|txt|ico|css|pdf)\.(php[0-9]?|phtml|jsp|asp)$|\.(php[0-9]?|phtml)\.(jpg|png|gif|txt|bak|old)$' && { score=$((score+1)); hits="$hits DOUBLE-EXT"; }
+  s=$(nfx_stat "$f"); m=${s%%|*}; sz=$(printf '%s' "$s" | cut -d'|' -f5); u=$(printf '%s' "$s" | cut -d'|' -f6); md=$(printf '%s' "$s" | cut -d'|' -f8)
+  [ $(( ( $(nfx_now_epoch) - m ) / 60 )) -lt "$mins" ] && { score=$((score+1)); hits="$hits RECENT"; }
+  case "$md" in *[2367]) score=$((score+1)); hits="$hits WORLD-WRITABLE";; esac
+  [ "$score" -ge "$MIN" ] || continue
+  if [ "$CSV" = 1 ]; then printf '%s,%s,%s,%s,%s,%s\n' "$score" "$(nfx_epoch_to_iso "$m")" "$sz" "$u" "$(nfx_csv "$f")" "$(nfx_csv "$hits")"
+  else
+    printf 'score=%-2s %s %8s uid=%-5s %s\n    hits: %s\n' "$score" "$(nfx_epoch_to_iso "$m")" "$sz" "$u" "$f" "$hits"
+    [ "$score" -ge 3 ] && nfx_flag "WEBSHELL-LIKELY" "score=$score $f [$hits]"
+    printf '%s' "$hits" | grep -q 'KNOWN-SHELL' && nfx_flag "KNOWN-SHELL" "$f"
+  fi
+done < "$TMPL"
+
+if [ "$CSV" = 0 ]; then
+  nfx_header "Scripts modified within $SINCE in web roots"
+  find "${PATHS[@]}" -xdev -type f -mmin -"$mins" 2>/dev/null | grep -E "$EXT_RE" | grep -vE '/(node_modules|vendor|\.git|cache)/' | head -60 | while read -r f; do printf '%s %s\n' "$(nfx_stat_line "$f" | awk '{print $1}')" "$f"; done
+  nfx_header "Server-side scripts in upload/image/media dirs (should be none)"
+  find "${PATHS[@]}" -xdev -type f 2>/dev/null | grep -E '/(uploads?|images?|img|media|files|attachments|avatars?|thumbs?|cache)/' | grep -E '\.(php[0-9]?|phtml|phar|jsp|jspx|asp|aspx|cgi|pl|sh)$' | head -40 | while read -r f; do nfx_flag "SCRIPT-IN-UPLOADS" "$f"; done
+  nfx_header ".htaccess / web.config handler tricks"
+  find "${PATHS[@]}" -xdev -type f \( -name '.htaccess' -o -name 'web.config' -o -name '.user.ini' -o -name 'php.ini' \) 2>/dev/null | head -100 | while read -r f; do
+    grep -nEi 'AddType.*php|AddHandler|SetHandler|auto_prepend_file|auto_append_file|php_value|RewriteRule.*\.(jpg|png|txt).*\.php|<FilesMatch.*(jpg|png|gif)|handlers.*add.*\.(jpg|png)' "$f" 2>/dev/null | while read -r l; do nfx_flag "HANDLER-TRICK" "$f:$l"; done
+  done
+  nfx_header "Hidden files in web roots"
+  find "${PATHS[@]}" -xdev -name '.*' -type f ! -name '.htaccess' ! -name '.htpasswd' ! -name '.gitignore' ! -name '.gitkeep' ! -name '.user.ini' ! -name '.env*' ! -name '.DS_Store' ! -path '*/.git/*' ! -path '*/.well-known/*' 2>/dev/null | head -30 | while read -r f; do nfx_info "hidden file: $f"; done
+  nfx_header "Web server process users writing to web roots"
+  for u in www-data apache nginx http httpd _www tomcat; do
+    id "$u" >/dev/null 2>&1 || continue
+    find "${PATHS[@]}" -xdev -type f -user "$u" -mmin -"$mins" 2>/dev/null | grep -E "$EXT_RE" | head -20 | while read -r f; do nfx_flag "WEBUSER-WROTE-SCRIPT" "script owned by web user '$u' modified within $SINCE: $f"; done
+  done
+  nfx_findings_summary
+fi

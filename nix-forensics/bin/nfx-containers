@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# nfx-containers - docker/podman/kubernetes inventory with privilege, mount and escape indicators
+set -u
+NFX_TOOL="nfx-containers"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-containers - containers, images, privileged/host-mount configurations, container escapes,
+kubernetes pods and whether this host is itself a container.
+
+Usage: nfx-containers [--since SPEC] [-o FILE] [--no-color]
+  --since SPEC   window for docker events / recently created containers (default 7d)
+
+Checks: privileged containers, --pid=host / --net=host, mounts of /, /etc, /var/run/docker.sock,
+/proc, /sys, added capabilities (SYS_ADMIN, SYS_PTRACE, SYS_MODULE, NET_ADMIN), images with
+unknown registries, containers running miners/shells, docker.sock exposed on TCP, runc/containerd
+shims, in-container indicators (docker.sock mounted inside this host, /.dockerenv).
+ATT&CK: T1610 (Deploy Container), T1611 (Escape to Host), T1613 (Container Discovery),
+T1612 (Build Image on Host), T1496 (Resource Hijacking), T1525 (Implant Internal Image).
+USAGE
+}
+SINCE="7d"
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do case "$1" in --since) SINCE="$2"; shift ;; *) nfx_die "unknown option: $1";; esac; shift; done
+mins=$(nfx_since_to_minutes "$SINCE")
+nfx_banner; nfx_root_hint
+
+nfx_header "Is this host a container?"
+[ -f /.dockerenv ] && nfx_info "/.dockerenv exists"
+grep -qaE 'docker|lxc|kubepods|containerd|libpod' /proc/1/cgroup 2>/dev/null && nfx_info "PID 1 cgroup: $(head -1 /proc/1/cgroup)"
+[ -S /var/run/docker.sock ] && { [ -f /.dockerenv ] && nfx_flag "DOCKER-SOCK-INSIDE" "docker.sock is present inside a container (host takeover path)"; }
+[ -r /proc/1/status ] && printf 'PID1 CapEff: %s\n' "$(awk '/CapEff/{print $2}' /proc/1/status)"
+nfx_is_linux && [ "$(awk '/CapEff/{print $2}' /proc/1/status 2>/dev/null)" = "000001ffffffffff" ] && [ -f /.dockerenv ] && nfx_flag "PRIVILEGED-SELF" "this container appears to run with full capabilities (privileged)"
+
+inspect_all() { # inspect_all <cli>
+  local cli="$1" id name
+  "$cli" ps -a --format '{{.ID}}' 2>/dev/null | while read -r id; do
+    name=$("$cli" inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##')
+    priv=$("$cli" inspect -f '{{.HostConfig.Privileged}}' "$id" 2>/dev/null)
+    pidm=$("$cli" inspect -f '{{.HostConfig.PidMode}}' "$id" 2>/dev/null)
+    netm=$("$cli" inspect -f '{{.HostConfig.NetworkMode}}' "$id" 2>/dev/null)
+    caps=$("$cli" inspect -f '{{join .HostConfig.CapAdd " "}}' "$id" 2>/dev/null)
+    img=$("$cli" inspect -f '{{.Config.Image}}' "$id" 2>/dev/null)
+    created=$("$cli" inspect -f '{{.Created}}' "$id" 2>/dev/null | cut -c1-19)
+    state=$("$cli" inspect -f '{{.State.Status}}' "$id" 2>/dev/null)
+    cmd=$("$cli" inspect -f '{{join .Config.Entrypoint " "}} {{join .Config.Cmd " "}}' "$id" 2>/dev/null)
+    mounts=$("$cli" inspect -f '{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' "$id" 2>/dev/null)
+    user=$("$cli" inspect -f '{{.Config.User}}' "$id" 2>/dev/null)
+    printf '%s %-24s %-10s img=%s created=%s user=%s\n    cmd=%s\n    priv=%s pid=%s net=%s caps=[%s]\n    mounts=%s\n' "$id" "$name" "$state" "$img" "$created" "${user:-root}" "$cmd" "$priv" "$pidm" "$netm" "$caps" "$mounts"
+    [ "$priv" = "true" ] && nfx_flag "PRIVILEGED" "$cli container $name ($id) is privileged"
+    [ "$pidm" = "host" ] && nfx_flag "PID-HOST" "$cli container $name shares host PID namespace"
+    [ "$netm" = "host" ] && nfx_info "$cli container $name uses host networking"
+    printf '%s' "$caps" | grep -qE 'SYS_ADMIN|SYS_PTRACE|SYS_MODULE|ALL|DAC_READ_SEARCH|SYS_RAWIO|NET_ADMIN' && nfx_flag "CAP-ADD" "$cli container $name adds capabilities: $caps"
+    printf '%s' "$mounts" | grep -qE '(^|[[:space:]])/:/|docker\.sock|containerd\.sock|crio\.sock|(^|[[:space:]])/etc:|(^|[[:space:]])/proc:|(^|[[:space:]])/sys:|(^|[[:space:]])/root:|(^|[[:space:]])/home:|(^|[[:space:]])/boot:|(^|[[:space:]])/dev:' && nfx_flag "HOST-MOUNT" "$cli container $name mounts sensitive host paths: $mounts"
+    printf '%s' "$cmd" | grep -qiE 'xmrig|minerd|kinsing|stratum|nc -|/bin/(ba)?sh -i|chroot /host|nsenter' && nfx_flag "SUSP-CMD" "$cli container $name cmd: $cmd"
+    printf '%s' "$img" | grep -qE '^(alpine|ubuntu|debian|busybox|centos|fedora|python|node)(:|$)' && [ "$priv" = "true" ] && nfx_flag "PRIV-BASE-IMAGE" "$cli privileged container from a bare base image (classic escape pattern): $name $img"
+  done
+}
+
+for cli in docker podman nerdctl; do
+  nfx_have "$cli" || continue
+  nfx_header "$cli"
+  "$cli" info 2>/dev/null | grep -E 'Server Version|Storage Driver|Cgroup|Runtimes|Default Runtime|Registry|Rootless|Security Options' | head -12
+  nfx_section "containers"
+  "$cli" ps -a --format 'table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null
+  nfx_section "inspection"
+  inspect_all "$cli"
+  nfx_section "images"
+  "$cli" images --format 'table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}' 2>/dev/null | head -60
+  "$cli" images --format '{{.Repository}}' 2>/dev/null | grep -E '^[a-z0-9.-]+(:[0-9]+)?/' | grep -vE '^(docker\.io|ghcr\.io|gcr\.io|quay\.io|registry\.k8s\.io|mcr\.microsoft\.com|public\.ecr\.aws|[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com|registry\.gitlab\.com|nvcr\.io|registry\.access\.redhat\.com|registry\.redhat\.io)/' | sort -u |
+    while read -r r; do nfx_info "image from a non-standard registry: $r"; done
+  nfx_section "events (last $SINCE)"
+  "$cli" events --since "${mins}m" --until 0s --format '{{.Time}} {{.Type}} {{.Action}} {{.Actor.Attributes.name}} {{.Actor.Attributes.image}}' 2>/dev/null | grep -E ' (create|start|exec_create|exec_start|destroy|pull) ' | tail -40
+  nfx_section "volumes / networks"
+  "$cli" volume ls 2>/dev/null | head -20; "$cli" network ls 2>/dev/null | head -20
+done
+[ -S /var/run/docker.sock ] && { nfx_section "docker.sock"; ls -la /var/run/docker.sock; sz=$(nfx_stat /var/run/docker.sock | cut -d'|' -f8); case "$sz" in *[67]) nfx_flag "DOCKER-SOCK-PERMS" "docker.sock world-writable (mode $sz)";; esac; }
+if nfx_is_linux; then
+  (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -E ':(2375|2376|2377|10250|10255|6443|8080)\s' | while read -r l; do nfx_flag "DOCKER-TCP" "container API / kubelet port listening: $l"; done
+  grep -rhE 'tcp://' /etc/docker/daemon.json /lib/systemd/system/docker.service /etc/systemd/system/docker.service.d/ 2>/dev/null | while read -r l; do nfx_flag "DOCKER-TCP" "docker daemon configured on TCP: $l"; done
+fi
+
+if nfx_have kubectl; then
+  nfx_header "kubernetes (kubectl)"
+  kubectl get nodes -o wide 2>/dev/null | head
+  nfx_section "pods (all namespaces)"; kubectl get pods -A -o wide 2>/dev/null | head -80
+  nfx_section "privileged / hostPID / hostNetwork pods"
+  kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{" priv="}{.spec.containers[*].securityContext.privileged}{" hostPID="}{.spec.hostPID}{" hostNet="}{.spec.hostNetwork}{" hostPath="}{.spec.volumes[*].hostPath.path}{"\n"}{end}' 2>/dev/null |
+    grep -E 'priv=true|hostPID=true|hostPath=/(etc|var/run|proc| |$)' | while read -r l; do nfx_flag "K8S-PRIV" "$l"; done
+fi
+nfx_have crictl && nfx_is_root && { nfx_header "crictl"; crictl ps -a 2>/dev/null | head -40; crictl images 2>/dev/null | head -30; }
+nfx_have ctr && nfx_is_root && { nfx_header "containerd (ctr)"; for ns in $(ctr namespaces list -q 2>/dev/null); do printf 'namespace %s\n' "$ns"; ctr -n "$ns" containers list 2>/dev/null | head -30; done; }
+nfx_have lxc && { nfx_header "lxc"; lxc list 2>/dev/null | head -30; }
+if nfx_is_linux; then
+  nfx_header "Container runtime processes on host"
+  ps -eo pid,ppid,user,etime,args 2>/dev/null | awk 'NR==1 || $5 ~ /(^|\/)(containerd-shim[a-z0-9-]*|runc|conmon|dockerd|containerd|podman|kubelet|crio)$/' | cut -c1-200 | head -40
+  nfx_section "processes inside containers running shells/miners (from host view)"
+  for d in /proc/[0-9]*; do
+    grep -qaE 'docker|containerd|kubepods|libpod' "$d/cgroup" 2>/dev/null || continue
+    cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    printf '%s' "$cmd" | grep -qiE "$NFX_SUSP_RE|xmrig|minerd|kinsing" && nfx_flag "CONTAINER-SUSP" "pid ${d#/proc/} in a container: $cmd"
+  done
+fi
+nfx_findings_summary

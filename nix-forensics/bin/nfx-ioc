@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# nfx-ioc - sweep the host for indicators of compromise: IPs, domains, hashes, filenames, strings
+set -u
+NFX_TOOL="nfx-ioc"
+_nfx_self="$0"
+while [ -L "$_nfx_self" ]; do
+  _t=$(readlink "$_nfx_self"); case "$_t" in /*) _nfx_self="$_t" ;; *) _nfx_self="$(dirname "$_nfx_self")/$_t" ;; esac
+done
+# shellcheck source=../lib/nfx-common.sh
+. "$(cd "$(dirname "$_nfx_self")/../lib" && pwd)/nfx-common.sh"
+
+usage() {
+  cat <<'USAGE'
+nfx-ioc - sweep a host for a list of indicators: IPv4/IPv6, domains/URLs, md5/sha1/sha256 hashes,
+file names/paths and free-text strings. Each indicator is classified automatically.
+
+Usage: nfx-ioc -i IOC_FILE [--path DIR]... [--no-hash] [--csv] [-o FILE]
+  -i FILE       indicators, one per line (# comments ok). Types are auto-detected.
+  --path DIR    directories to grep for strings/domains/IPs and to hash (repeatable;
+                default: /etc /tmp /var/tmp /dev/shm /home /root /opt /srv /var/www /var/log /Users /Library)
+  --no-hash     skip hashing files/processes (fast mode: only network, logs, history, config sweep)
+  --csv         CSV: ioc,type,source,evidence
+
+Where it looks: live connections & listeners, ARP, /etc/hosts, resolv.conf, DNS cache (where
+available), shell history, cron/systemd/launchd, ssh keys/known_hosts, /var/log & journal, unified
+log (macOS), file names via find, file contents via grep -r (text files), file & process hashes.
+ATT&CK: any - IOC-driven scoping across T1071/T1105/T1059/T1053/T1098.
+USAGE
+}
+IOCF=""; PATHS=(); NOHASH=0; CSV=0
+nfx_std_args "$@"
+set -- "${NFX_ARGS[@]+"${NFX_ARGS[@]}"}"
+while [ $# -gt 0 ]; do case "$1" in -i) IOCF="$2"; shift ;; --path) PATHS+=("$2"); shift ;; --no-hash) NOHASH=1 ;; --csv) CSV=1 ;; *) nfx_die "unknown option: $1";; esac; shift; done
+[ -r "$IOCF" ] || nfx_die "-i IOC_FILE is required and must be readable"
+if [ ${#PATHS[@]} -eq 0 ]; then for d in /etc /tmp /var/tmp /dev/shm /home /root /opt /srv /var/www /var/log /Users /Library /private/tmp /private/var/log; do [ -d "$d" ] && PATHS+=("$d"); done; fi
+[ "$CSV" = 1 ] || { nfx_banner; nfx_root_hint; nfx_info "paths: ${PATHS[*]}"; }
+[ "$CSV" = 1 ] && echo "ioc,type,source,evidence"
+
+hit() { # hit <ioc> <type> <source> <evidence>
+  if [ "$CSV" = 1 ]; then printf '%s,%s,%s,%s\n' "$(nfx_csv "$1")" "$2" "$(nfx_csv "$3")" "$(nfx_csv "$4")"
+  else nfx_flag "IOC-$2" "$1 | $3 | $4"; fi
+}
+classify() {
+  local v="$1"
+  if printf '%s' "$v" | grep -qE '^[0-9a-fA-F]{64}$'; then echo sha256
+  elif printf '%s' "$v" | grep -qE '^[0-9a-fA-F]{40}$'; then echo sha1
+  elif printf '%s' "$v" | grep -qE '^[0-9a-fA-F]{32}$'; then echo md5
+  elif printf '%s' "$v" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?$'; then echo ip
+  elif printf '%s' "$v" | grep -qE '^[0-9a-fA-F:]+:[0-9a-fA-F:]*$' && printf '%s' "$v" | grep -q ':'; then echo ip
+  elif printf '%s' "$v" | grep -qE '^(https?|ftp|wss?)://'; then echo url
+  elif printf '%s' "$v" | grep -qiE '^[A-Za-z0-9._-]+\.(php[0-9]?|phtml|sh|bash|py|pl|rb|js|jsp|asp|aspx|exe|elf|bin|so|dylib|dll|jar|war|class|txt|log|conf|cfg|ini|plist|json|xml|ya?ml|tar|tgz|gz|xz|bz2|zip|7z|rar|jpg|jpeg|png|gif|pdf|docx?|xlsx?|pptx?|apk|dmg|pkg|app|c|o|out|dat|db|sqlite|key|pem|crt|deb|rpm|iso|img|vbs|ps1|bat|cmd|scr|lnk|service|timer|desktop)$'; then echo filename
+  elif printf '%s' "$v" | grep -qE '^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$'; then echo domain
+  elif printf '%s' "$v" | grep -qE '^/'; then echo path
+  elif printf '%s' "$v" | grep -qE '^[A-Za-z0-9._-]+$' && printf '%s' "$v" | grep -qE '\.'; then echo filename
+  else echo string; fi
+}
+
+IOCS=$(nfx_mktemp); grep -vE '^[[:space:]]*(#|$)' "$IOCF" | sed 's/[[:space:]]*$//' | sort -u > "$IOCS"
+NET=$(nfx_mktemp); HIST=$(nfx_mktemp); LOGS=$(nfx_mktemp); CFG=$(nfx_mktemp)
+# ---- gather sources once
+{ if nfx_is_macos; then lsof -nP -i 2>/dev/null; netstat -an 2>/dev/null; arp -an 2>/dev/null; scutil --dns 2>/dev/null
+  else (ss -tunap 2>/dev/null || netstat -tunap 2>/dev/null); (ip neigh 2>/dev/null || arp -an 2>/dev/null); fi
+  cat /etc/hosts /etc/resolv.conf 2>/dev/null
+  nfx_is_linux && nfx_have resolvectl && resolvectl statistics 2>/dev/null
+} > "$NET"
+nfx_user_homes | while IFS=: read -r u uid h sh; do for f in .bash_history .zsh_history .sh_history .zhistory .python_history .local/share/fish/fish_history; do [ -f "$h/$f" ] && sed "s#^#$u:$f: #" "$h/$f"; done; done > "$HIST" 2>/dev/null
+{ for f in /etc/crontab /etc/cron.d/* /var/spool/cron/crontabs/* /var/spool/cron/* /usr/lib/cron/tabs/* /etc/systemd/system/*.service /etc/systemd/system/*.timer /etc/rc.local /etc/ld.so.preload /etc/profile /etc/profile.d/* /etc/bash.bashrc /etc/zshrc /Library/LaunchDaemons/*.plist /Library/LaunchAgents/*.plist /etc/ssh/sshd_config /etc/sudoers /etc/sudoers.d/* /etc/environment; do [ -f "$f" ] && sed "s#^#$f: #" "$f" 2>/dev/null; done
+  nfx_user_homes | while IFS=: read -r u uid h sh; do for f in .ssh/authorized_keys .ssh/known_hosts .ssh/config .bashrc .profile .zshrc .config/systemd/user/*.service Library/LaunchAgents/*.plist; do [ -f "$h/$f" ] && sed "s#^#$h/$f: #" "$h/$f" 2>/dev/null; done; done
+} > "$CFG" 2>/dev/null
+{ for f in /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages /var/log/system.log /var/log/kern.log /var/log/cron /var/log/audit/audit.log /var/log/apache2/access.log /var/log/nginx/access.log /var/log/httpd/access_log /var/log/apt/history.log /var/log/dpkg.log /var/log/install.log; do [ -e "$f" ] && nfx_read_logs "$f" 2>/dev/null | sed "s#^#$f: #"; done
+  nfx_is_linux && nfx_have journalctl && journalctl -q --no-pager -o short-iso 2>/dev/null | sed 's#^#journal: #'
+} > "$LOGS" 2>/dev/null
+
+[ "$CSV" = 1 ] || nfx_info "loaded $(wc -l < "$IOCS" | tr -d ' ') indicators; sources: net=$(wc -l < "$NET" | tr -d ' ') hist=$(wc -l < "$HIST" | tr -d ' ') cfg=$(wc -l < "$CFG" | tr -d ' ') logs=$(wc -l < "$LOGS" | tr -d ' ') lines"
+
+HASHLIST=$(nfx_mktemp); grep -E '^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$' "$IOCS" > "$HASHLIST"
+while IFS= read -r ioc; do
+  t=$(classify "$ioc")
+  [ "$CSV" = 1 ] || nfx_section "$ioc  [$t]"
+  case "$t" in
+    md5|sha1|sha256) continue ;;   # handled in the hash pass below
+    ip|domain|url|string|filename|path)
+      key="$ioc"; [ "$t" = url ] && key=$(printf '%s' "$ioc" | sed -E 's#^[a-z]+://##; s#/.*$##')
+      grep -F -- "$key" "$NET"  | head -10 | while read -r l; do hit "$ioc" "$t" "network" "$l"; done
+      grep -F -- "$key" "$HIST" | head -10 | while read -r l; do hit "$ioc" "$t" "shell-history" "$l"; done
+      grep -F -- "$key" "$CFG"  | head -10 | while read -r l; do hit "$ioc" "$t" "config/persistence" "$l"; done
+      grep -F -- "$key" "$LOGS" | head -10 | while read -r l; do hit "$ioc" "$t" "logs" "$(printf '%s' "$l" | cut -c1-300)"; done
+      if [ "$t" = filename ] || [ "$t" = path ] || [ "$t" = domain ]; then
+        if [ "$t" = path ]; then [ -e "$ioc" ] && hit "$ioc" "$t" "filesystem" "$(nfx_stat_line "$ioc")"
+        else find "${PATHS[@]}" -xdev -name "$ioc" 2>/dev/null | head -20 | while read -r f; do hit "$ioc" "$t" "filesystem" "$(nfx_stat_line "$f")"; done; fi
+      fi
+      if [ "$t" = string ] || [ "$t" = domain ] || [ "$t" = url ] || [ "$t" = ip ] || [ "$t" = filename ]; then
+        grep -rIlF --exclude-dir=.git --exclude-dir=node_modules --exclude='*.journal' -- "$key" "${PATHS[@]}" 2>/dev/null | head -20 | while read -r f; do
+          case "$f" in /var/log/*|/private/var/log/*) continue;; esac  # already covered
+          hit "$ioc" "$t" "file-content" "$f: $(grep -F -m1 -- "$key" "$f" 2>/dev/null | cut -c1-200)"
+        done
+        if nfx_is_linux; then for d in /proc/[0-9]*; do p=${d#/proc/}; [ "$p" = "$$" ] || [ "$p" = "$PPID" ] && continue; tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -qF -- "$key" && hit "$ioc" "$t" "process-cmdline" "pid $p: $(tr '\0' ' ' < "$d/cmdline" | cut -c1-200)"; done
+        else ps -axo pid=,args= 2>/dev/null | grep -F -- "$key" | grep -vE "^ *($$|$PPID) |nfx-ioc" | head -5 | while read -r l; do hit "$ioc" "$t" "process-cmdline" "$l"; done; fi
+      fi
+      if nfx_is_macos && { [ "$t" = domain ] || [ "$t" = url ] || [ "$t" = ip ]; }; then
+        log show --last 7d --predicate "eventMessage CONTAINS \"$key\"" --style compact 2>/dev/null | tail -5 | while read -r l; do hit "$ioc" "$t" "unified-log" "$l"; done
+      fi ;;
+  esac
+done < "$IOCS"
+
+if [ -s "$HASHLIST" ] && [ "$NOHASH" = 0 ]; then
+  [ "$CSV" = 1 ] || nfx_header "Hash sweep ($(wc -l < "$HASHLIST" | tr -d ' ') hashes; files < 64MB under paths + running processes)"
+  for alg in md5 sha1 sha256; do
+    case "$alg" in md5) n=32;; sha1) n=40;; sha256) n=64;; esac
+    L=$(nfx_mktemp); grep -E "^[0-9a-fA-F]{$n}\$" "$HASHLIST" | tr 'A-F' 'a-f' > "$L"; [ -s "$L" ] || continue
+    "$NFX_BIN_DIR/nfx-hash" -a "$alg" --max-size 64 "${PATHS[@]}" 2>/dev/null | tail -n +2 | while IFS=, read -r h rest; do grep -qxF "$h" "$L" && hit "$h" "$alg" "file-hash" "$rest"; done
+    "$NFX_BIN_DIR/nfx-hash" -a "$alg" --procs 2>/dev/null | tail -n +2 | while IFS=, read -r h rest; do grep -qxF "$h" "$L" && hit "$h" "$alg" "process-hash" "$rest"; done
+  done
+fi
+[ "$CSV" = 1 ] || nfx_findings_summary
